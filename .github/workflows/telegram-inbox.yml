@@ -1,0 +1,44 @@
+name: telegram-inbox
+
+# Revisa los archivos que envías al bot por Telegram (transcripciones de TIKR, etc.) y te responde con el análisis.
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # cada 10 minutos, todos los días (GitHub puede retrasarlo unos minutos)
+  workflow_dispatch:
+
+concurrency: telegram-inbox
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      EARNINGS_DB: inbox.db
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install requests anthropic pypdf python-docx beautifulsoup4 lxml
+
+      # Recuerda qué mensajes ya se han procesado
+      - uses: actions/cache/restore@v4
+        with:
+          path: inbox.db
+          key: inbox-db-${{ github.run_id }}
+          restore-keys: inbox-db-
+
+      - name: Revisar mensajes de Telegram
+        run: python earnings_alerts.py --inbox
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: inbox.db
+          key: inbox-db-${{ github.run_id }}
