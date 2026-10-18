@@ -1067,6 +1067,9 @@ def looks_like_results(text):
 EU_SOURCES = {
     "ADYEN.AS": {"name": "Adyen", "sector": "Europa · Pagos", "page": "https://investors.adyen.com/financials",
                  "pattern": r"https?://(?:www\.)?adyen\.com/press-and-media/adyen-publishes-[^\"'#?]+|/financials/(?:q[1-4]|h[12])-20\d\d[^\"'#?]*"},
+    # Empresas que distribuyen sus comunicados por MFN (mfn.se): página por empresa con el texto completo
+    "RMS.PA": {"name": "Hermès", "sector": "Europa · Lujo", "mfn": "hermes"},
+    "KER.PA": {"name": "Kering", "sector": "Europa · Lujo", "mfn": "kering"},
     "MC.PA": {"name": "LVMH", "sector": "Europa · Lujo", "page": "https://www.lvmh.com/en/investors",
               "pattern": r"/en/financial-calendar/20\d\d-[a-z0-9-]*(?:revenue|results)[a-z0-9-]*"},
 }
@@ -1100,6 +1103,14 @@ def period_key(text):
     m = re.search(r"(20\d\d)[-_ ](?:first|1st)[-_ ]half", t)
     if m:
         return f"h1-{m.group(1)}"
+    year = re.search(r"\b(20\d\d)\b", t)
+    if year:
+        for words, code in ((r"first quarter|three months", "q1"), (r"second quarter", "q2"),
+                            (r"third quarter|nine months|9 months", "q3"), (r"fourth quarter", "q4"),
+                            (r"first[- ]half|half[- ]year|interim|six months", "h1"),
+                            (r"full[- ]year|annual|twelve months", "fy")):
+            if re.search(words, t):
+                return f"{code}-{year.group(1)}"
     m = re.search(r"(20\d\d)[-_ ](?:annual|full[-_ ]year)", t)
     return f"fy-{m.group(1)}" if m else text
 
@@ -1131,6 +1142,38 @@ def investegate_text(url):
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(_web_get(url).text, "lxml")
     box = soup.select_one("div.news-window") or soup.select_one("div.aspose-root") or soup.body
+    return html_to_text(str(box))
+
+
+MFN_RESULTS_RE = re.compile(r"results|revenue|sales|quarter|half[- ]year|first half|nine months|trading update|"
+                            r"interim report", re.I)
+MFN_NOT_RE = re.compile(r"availability|notice|webcast|conference call|statement number|voting rights|"
+                        r"share buyback|transactions? in own shares|disclosure of trading|liquidity", re.I)
+
+
+def mfn_list(slug):
+    """[(url, título)] de los comunicados de una empresa en MFN (más recientes primero)."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(_web_get(f"https://mfn.se/all/a/{slug}").text, "lxml")
+    out, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"] if a["href"].startswith("http") else "https://mfn.se" + a["href"]
+        title = a.get_text(" ", strip=True)
+        if f"/a/{slug}/" in href and title and href not in seen:
+            seen.add(href)
+            out.append((href, title))
+    return out
+
+
+def mfn_items(slug):
+    """Comunicados de resultados en MFN: [(clave de periodo, título, url)]."""
+    return [(period_key(t), t, u) for u, t in mfn_list(slug) if MFN_RESULTS_RE.search(t) and not MFN_NOT_RE.search(t)]
+
+
+def mfn_text(url):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(_web_get(url).text, "lxml")
+    box = soup.find("main") or soup.find("article") or soup.body
     return html_to_text(str(box))
 
 
@@ -1246,6 +1289,8 @@ def eu_candidates(conn, ticker):
     if ticker.endswith(".L"):
         items = [(i, f"{t} ({d})", u) for i, d, t, u in investegate_list(ticker[:-2])
                  if RNS_RESULTS_RE.search(t) and not RNS_NOT_RESULTS_RE.search(t)]
+    elif "mfn" in EU_SOURCES[ticker]:
+        items = mfn_items(EU_SOURCES[ticker]["mfn"])
     else:
         items = [(period_key(u), u.rsplit("/", 1)[-1], u) for u in ir_links(EU_SOURCES[ticker])]
     if seen is None:                       # primera vez: todo lo existente es historia
@@ -1283,6 +1328,8 @@ def eu_analyze(conn, ticker, k, url, notify=True, dry_run=False):
     company = eu_company(ticker)
     if ticker.endswith(".L"):
         text, doc_url = investegate_text(url), url
+    elif "mfn" in EU_SOURCES.get(ticker, {}):
+        text, doc_url = mfn_text(url), url
     else:
         text, doc_url = ir_document(url)
         if not text:
@@ -1340,6 +1387,8 @@ def run_eu_latest(conn, ticker, dry_run=False):
     if ticker.endswith(".L"):
         items = [(i, t, u) for i, d, t, u in investegate_list(ticker[:-2], pages=6)
                  if RNS_RESULTS_RE.search(t) and not RNS_NOT_RESULTS_RE.search(t)]
+    elif "mfn" in EU_SOURCES[ticker]:
+        items = sorted(mfn_items(EU_SOURCES[ticker]["mfn"]), key=lambda i: period_rank(i[0]), reverse=True)
     else:
         items = sorted(((period_key(u), u, u) for u in ir_links(EU_SOURCES[ticker])),
                        key=lambda i: period_rank(i[0]), reverse=True)
