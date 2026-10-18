@@ -304,12 +304,12 @@ ANALYSIS_PROMPT = """Eres un analista de renta variable. Analiza el comunicado d
 
 Registra tu análisis llamando a la herramienta "registrar_resultado". Si no puedes usarla, devuelve SOLO un JSON válido con esta estructura:
 {{
-  "periodo": "trimestre y año fiscal, p. ej. '3T FY2026'",
+  "periodo": "periodo PRINCIPAL del comunicado: trimestre si es trimestral ('3T FY2026'); semestre ('1S 2026') o año ('FY2026') si el comunicado es semestral o anual",
   "es_resultados": true si el documento es un comunicado de resultados o una actualización trimestral de ventas; false si es otra cosa (recompras, juntas, nombramientos…),
   "moneda": código ISO de la moneda en que presenta las cuentas (USD, EUR, DKK, GBP, CHF, TWD, SEK…),
-  "ingresos_musd": número: ingresos totales del trimestre en MILLONES de esa moneda (p. ej. 94930.0 para 94,93 mil millones), o null,
+  "ingresos_musd": número: ingresos totales de ESE periodo principal (no de un trimestre suelto dentro de un semestre) en MILLONES de esa moneda (p. ej. 94930.0 para 94,93 mil millones), o null,
   "crec_ingresos_pct": número: variación interanual de esos ingresos en % (p. ej. 8.2 o -3.1); si la empresa destaca el crecimiento orgánico o a tipo constante, usa ese, o null,
-  "bpa": número: BPA diluido del trimestre en esa moneda (ajustado si la empresa lo da; si no, GAAP/IFRS), o null (muchas europeas solo publican ventas en el 1T y 3T),
+  "bpa": número: BPA diluido de ese periodo en esa moneda (ajustado si la empresa lo da; si no, GAAP/IFRS), o null (muchas europeas solo publican ventas en el 1T y 3T),
   "bpa_tipo": "ajustado" | "GAAP",
   "vs_consenso": "bate" | "en linea" | "decepciona" | "sin consenso",
   "guidance": "sube" | "mantiene" | "baja" | "inicia" | "retira" | "no da",
@@ -348,8 +348,10 @@ ANALYSIS_TOOL = {
         "properties": {
             "es_resultados": {"type": "boolean", "description": "Es un comunicado de resultados o de ventas trimestrales"},
             "moneda": {"type": "string", "description": "Código ISO de la moneda de presentación, p. ej. USD, EUR, DKK"},
-            "periodo": _nullable("string"),
-            "ingresos_musd": {"type": ["number", "null"], "description": "Ingresos totales en millones de la moneda"},
+            "periodo": {"type": ["string", "null"],
+                        "description": "Periodo principal del comunicado (trimestre, semestre o año)"},
+            "ingresos_musd": {"type": ["number", "null"],
+                              "description": "Ingresos totales del periodo principal en millones de la moneda"},
             "crec_ingresos_pct": {"type": ["number", "null"],
                                   "description": "Variación interanual en % (orgánica si la empresa la destaca)"},
             "bpa": {"type": ["number", "null"], "description": "BPA diluido en la moneda"},
