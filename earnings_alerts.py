@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""
+Earnings Alerts — resultados del S&P 500 por Telegram.
+
+Detecta los comunicados de resultados que las empresas del S&P 500 presentan a la
+SEC (formulario 8-K, item 2.02), los analiza con Claude y te envía un resumen
+diario por Telegram agrupado por sector.
+
+Uso:
+  python earnings_alerts.py               # revisa resultados nuevos y los analiza
+  python earnings_alerts.py --summary     # envía el resumen de lo pendiente
+  python earnings_alerts.py --ticker MSFT # analiza el último resultado de una empresa y te lo envía
+  python earnings_alerts.py --test        # mensaje de prueba a Telegram
+  Añade --dry-run para imprimir en pantalla en lugar de enviar.
+"""
+import argparse
+import html
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from io import StringIO
+
+import requests
+
+# ---------------------------------------------------------------- configuración
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+MODEL_FAST = os.environ.get("CLAUDE_MODEL_FAST", "claude-haiku-5-5")    # análisis de cada empresa
+MODEL_SMART = os.environ.get("CLAUDE_MODEL_SMART", "claude-sonnet-5-5")  # lectura del día
+
+DB_PATH = os.environ.get("EARNINGS_DB", "earnings.db")
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "2"))  # días hacia atrás que revisa
+MAX_DOC_CHARS = 60_000      # recorta comunicados muy largos (ahorra coste)
+MAX_ATTEMPTS = 3            # reintentos de análisis por filing
+SEC_DELAY = 0.12            # la SEC permite 10 peticiones/segundo
+TELEGRAM_LIMIT = 3900       # Telegram corta en 4096 caracteres
+
+WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+SECTOR_ES = {
+    "Information Technology": "Tecnología",
+    "Health Care": "Salud",
+    "Financials": "Financieras",
+    "Consumer Discretionary": "Consumo discrecional",
+    "Consumer Staples": "Consumo básico",
+    "Communication Services": "Comunicaciones",
+    "Industrials": "Industriales",
+    "Energy": "Energía",
+    "Materials": "Materiales",
+    "Real Estate": "Inmobiliario",
+    "Utilities": "Utilities",
+}
+
+SESSION = requests.Session()
+
+
+def log(msg):
+    print(f"[{datetime.now(timezone.utc):%H:%M:%S}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------- base de datos
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS filings (
+        accession TEXT PRIMARY KEY, cik INTEGER, ticker TEXT, name TEXT, sector TEXT,
+        filing_date TEXT, acceptance TEXT, url TEXT, analysis TEXT,
+        status TEXT DEFAULT 'pending', attempts INTEGER DEFAULT 0,
+        input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+        summarized INTEGER DEFAULT 0, created_at TEXT)""")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT, updated TEXT)")
+    conn.commit()
+    return conn
+
+
+# ---------------------------------------------------------------- red
+def sec_get(url, retries=4):
+    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
+    for attempt in range(retries):
+        time.sleep(SEC_DELAY)
+        try:
+            r = SESSION.get(url, headers=headers, timeout=30)
+        except requests.RequestException:
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 200:
+            return r
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(3 * (attempt + 1))
+            continue
+        r.raise_for_status()
+    raise RuntimeError(f"La SEC no responde: {url}")
+
+
+# ---------------------------------------------------------------- S&P 500
+def load_sp500(conn):
+    """Lista del S&P 500 desde Wikipedia (ticker, nombre, sector, CIK). Se refresca cada 7 días."""
+    row = conn.execute("SELECT value, updated FROM meta WHERE key='sp500'").fetchone()
+    if row:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(row[1])
+        if age < timedelta(days=7):
+            return json.loads(row[0])
+    try:
+        import pandas as pd
+        page = SESSION.get(WIKI_SP500, headers={"User-Agent": SEC_USER_AGENT or "earnings-alerts"}, timeout=30)
+        page.raise_for_status()
+        df = pd.read_html(StringIO(page.text), attrs={"id": "constituents"})[0]
+        companies, seen = [], set()
+        for _, r in df.iterrows():
+            cik = int(r["CIK"])
+            if cik in seen:  # GOOGL/GOOG, FOX/FOXA… comparten CIK
+                continue
+            seen.add(cik)
+            companies.append({
+                "ticker": str(r["Symbol"]).strip(),
+                "name": str(r["Security"]).strip(),
+                "sector": SECTOR_ES.get(str(r["GICS Sector"]).strip(), str(r["GICS Sector"]).strip()),
+                "cik": cik,
+            })
+        if len(companies) < 400:
+            raise RuntimeError(f"Lista sospechosa: {len(companies)} empresas")
+        conn.execute("REPLACE INTO meta VALUES ('sp500', ?, ?)",
+                     (json.dumps(companies), datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        log(f"Lista del S&P 500 actualizada: {len(companies)} empresas")
+        return companies
+    except Exception as e:
+        if row:
+            log(f"No se pudo actualizar la lista ({e}); uso la guardada")
+            return json.loads(row[0])
+        raise
+
+
+# ---------------------------------------------------------------- SEC: detectar resultados
+def earnings_filings(company, since_date):
+    """8-K con item 2.02 (Results of Operations) desde since_date (YYYY-MM-DD)."""
+    data = sec_get(f"https://data.sec.gov/submissions/CIK{company['cik']:010d}.json").json()
+    rec = data["filings"]["recent"]
+    out = []
+    for i, form in enumerate(rec["form"]):
+        if form != "8-K" or rec["filingDate"][i] < since_date:
+            continue
+        if not re.search(r"(^|,)\s*2\.02\s*(,|$)", rec["items"][i] or ""):
+            continue
+        out.append({
+            "accession": rec["accessionNumber"][i],
+            "filing_date": rec["filingDate"][i],
+            "acceptance": rec["acceptanceDateTime"][i],
+            "primary": rec["primaryDocument"][i],
+        })
+    return out
+
+
+def html_to_text(raw_html):
+    """Convierte el HTML del comunicado en texto, conservando las tablas como filas 'a | b | c'."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(raw_html, "lxml")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        cells = [c for c in cells if c and c not in ("$", "%", ")", "(")]
+        tr.replace_with(soup.new_string(" | ".join(cells) + "\n"))
+    text = soup.get_text("\n")
+    text = re.sub(r"[ \t\xa0\u200b]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
+def fetch_press_release(cik, filing):
+    """Descarga el comunicado (anexo EX-99.x). Si no hay anexo, usa el 8-K principal."""
+    from bs4 import BeautifulSoup
+    acc = filing["accession"]
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/"
+    docs = []
+    try:
+        index = sec_get(f"{base}{acc}-index.htm").text
+        soup = BeautifulSoup(index, "lxml")
+        for tr in soup.select("table.tableFile tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 4:
+                continue
+            link, doc_type = tds[2].find("a"), tds[3].get_text(strip=True).upper()
+            if link and doc_type.startswith("EX-99"):
+                href = link["href"].replace("/ix?doc=", "")
+                if href.lower().endswith((".htm", ".html", ".txt")):
+                    docs.append((doc_type, "https://www.sec.gov" + href if href.startswith("/") else base + href))
+    except Exception as e:
+        log(f"  índice no disponible ({e})")
+    docs.sort(key=lambda d: d[0])  # EX-99.1 primero
+    if not docs:
+        docs = [("8-K", base + filing["primary"])]
+
+    parts, total = [], 0
+    for doc_type, url in docs[:3]:
+        text = html_to_text(sec_get(url).text)
+        parts.append(f"=== {doc_type} ===\n{text}")
+        total += len(text)
+        if total >= MAX_DOC_CHARS:
+            break
+    return "\n\n".join(parts)[:MAX_DOC_CHARS], docs[0][1]
+
+
+# ---------------------------------------------------------------- consenso (gratis, Yahoo)
+def eps_consensus(ticker, filing_date):
+    """BPA estimado por el consenso para ese trimestre (Yahoo Finance). None si no lo encuentra."""
+    try:
+        import yfinance as yf
+        df = yf.Ticker(ticker.replace(".", "-")).get_earnings_dates(limit=8)
+        if df is None or df.empty or "EPS Estimate" not in df.columns:
+            return None
+        target = datetime.fromisoformat(filing_date).date()
+        for ts, r in df.iterrows():
+            if abs((ts.date() - target).days) <= 3 and r["EPS Estimate"] == r["EPS Estimate"]:
+                return float(r["EPS Estimate"])
+    except Exception as e:
+        log(f"  consenso no disponible para {ticker} ({e})")
+    return None
+
+
+# ---------------------------------------------------------------- Claude
+ANALYSIS_PROMPT = """Eres un analista de renta variable. Analiza el comunicado de resultados de {name} ({ticker}, sector {sector}), presentado a la SEC el {date}.
+{consensus_line}
+
+Devuelve SOLO un JSON válido, sin texto antes ni después, con esta estructura:
+{{
+  "periodo": "trimestre y año fiscal, p. ej. '3T FY2026'",
+  "ingresos": "cifra con unidad, p. ej. '94,9 mil M$'",
+  "crec_ingresos": "variación interanual, p. ej. '+8%', o null",
+  "bpa": "BPA ajustado si existe, con '(GAAP)' si solo hay GAAP, p. ej. '1,85 $'",
+  "vs_consenso": "bate" | "en linea" | "decepciona" | null,
+  "guidance": "sube" | "mantiene" | "baja" | "inicia" | "retira" | "no da",
+  "guidance_detalle": "una frase con las cifras, o null",
+  "destacados": ["máximo 3 puntos concretos con cifras: márgenes, segmentos, KPIs clave"],
+  "alertas": ["solo hechos excepcionales: recorte o fuerte subida del dividendo, recompra relevante, cambio de CEO/CFO, deterioros, reformulación de cuentas, adquisición, reestructuración. Lista vacía si no hay"],
+  "tono": "positivo" | "neutro" | "negativo",
+  "resumen": "una frase de máximo 25 palabras con la lectura del trimestre"
+}}
+
+Reglas: escribe en español con formato numérico español; usa solo datos del documento (y el consenso indicado); no inventes; si un dato no aparece, pon null. "vs_consenso" solo si se te ha dado el consenso (compáralo con el BPA ajustado). "tono" refleja la calidad del trimestre y del guidance, no el lenguaje de la empresa.
+
+DOCUMENTO:
+{doc}"""
+
+DAILY_PROMPT = """Eres un gestor de renta variable. Estos son los resultados del S&P 500 publicados en las últimas horas (JSON por empresa):
+
+{data}
+
+Escribe la "lectura del día" en español: entre 3 y 5 viñetas breves (máximo 30 palabras cada una) sobre tendencias por sector, sorpresas relevantes y cambios de guidance que merezcan atención. Cita los tickers. Sin introducción ni conclusión. Usa '• ' al inicio de cada viñeta y no uses markdown."""
+
+_client = None
+
+
+def claude(prompt, model, max_tokens):
+    global _client
+    if _client is None:
+        import anthropic
+        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = _client.messages.create(model=model, max_tokens=max_tokens,
+                                  messages=[{"role": "user", "content": prompt}])
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    return text, msg.usage.input_tokens, msg.usage.output_tokens
+
+
+def parse_json(text):
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < 0:
+        raise ValueError("Claude no devolvió JSON")
+    return json.loads(text[start:end + 1])
+
+
+def analyze(company, filing, doc):
+    consensus = eps_consensus(company["ticker"], filing["filing_date"])
+    consensus_line = (f"Consenso de BPA para este trimestre (Yahoo Finance, normalmente ajustado): {consensus:.2f} $."
+                      if consensus is not None else "No hay dato de consenso disponible.")
+    prompt = ANALYSIS_PROMPT.format(name=company["name"], ticker=company["ticker"], sector=company["sector"],
+                                    date=filing["filing_date"], consensus_line=consensus_line, doc=doc)
+    text, tin, tout = claude(prompt, MODEL_FAST, 1500)
+    data = parse_json(text)
+    data["consenso_bpa"] = consensus
+    return data, tin, tout
+
+
+# ---------------------------------------------------------------- Telegram
+def send_telegram(text, dry_run=False):
+    if dry_run:
+        print("\n" + "-" * 60 + "\n" + text + "\n" + "-" * 60)
+        return
+    r = SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                     data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
+                           "disable_web_page_preview": "true"}, timeout=30)
+    if r.status_code != 200:
+        log(f"Error de Telegram: {r.text[:300]}")
+    time.sleep(1)
+
+
+def send_blocks(header, blocks, dry_run=False):
+    """Envía bloques completos sin partir ninguno, en mensajes de menos de 4096 caracteres."""
+    current = header
+    for block in blocks:
+        if len(current) + len(block) + 2 > TELEGRAM_LIMIT:
+            send_telegram(current, dry_run)
+            current = ""
+        current = f"{current}\n\n{block}" if current else block
+    if current:
+        send_telegram(current, dry_run)
+
+
+# ---------------------------------------------------------------- formato
+TONE = {"positivo": "🟢", "neutro": "🟡", "negativo": "🔴"}
+VS = {"bate": " ✅", "en linea": " ➖", "decepciona": " ❌"}
+GUIDE = {"sube": "Guía ⬆️", "mantiene": "Guía ➡️", "baja": "Guía ⬇️", "inicia": "Guía 🆕", "retira": "Guía ⛔"}
+
+
+def esc(value):
+    return html.escape(str(value)) if value not in (None, "") else ""
+
+
+def company_line(row):
+    a = row["analysis"]
+    ventas = esc(a.get("ingresos"))
+    if a.get("crec_ingresos"):
+        ventas += f" ({esc(a['crec_ingresos'])})"
+    bits = []
+    if ventas:
+        bits.append(f"Ventas {ventas}")
+    if a.get("bpa"):
+        bits.append(f"BPA {esc(a['bpa'])}{VS.get(a.get('vs_consenso'), '')}")
+    if a.get("guidance") in GUIDE:
+        bits.append(GUIDE[a["guidance"]])
+    lines = [f"{TONE.get(a.get('tono'), '⚪')} <a href=\"{esc(row['url'])}\"><b>{esc(row['ticker'])}</b></a> "
+             f"{esc(row['name'])} · {esc(a.get('periodo'))}"]
+    if bits:
+        lines.append("   " + " · ".join(bits))
+    if a.get("resumen"):
+        lines.append(f"   <i>{esc(a['resumen'])}</i>")
+    for alert in a.get("alertas") or []:
+        lines.append(f"   ⚠️ {esc(alert)}")
+    return "\n".join(lines)
+
+
+def company_detail(row):
+    a = row["analysis"]
+    out = [company_line(row)]
+    if a.get("consenso_bpa") is not None:
+        out.append(f"\nConsenso BPA: {a['consenso_bpa']:.2f} $".replace(".", ","))
+    if a.get("guidance_detalle"):
+        out.append(f"\n<b>Guidance:</b> {esc(a['guidance_detalle'])}")
+    if a.get("destacados"):
+        out.append("\n<b>Destacados</b>\n" + "\n".join(f"• {esc(d)}" for d in a["destacados"]))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- flujos principales
+def process(conn, company, filing):
+    """Descarga y analiza un filing; guarda el resultado. Devuelve la fila o None."""
+    acc = filing["accession"]
+    row = conn.execute("SELECT status, attempts FROM filings WHERE accession=?", (acc,)).fetchone()
+    if row and (row[0] == "ok" or row[1] >= MAX_ATTEMPTS):
+        return None
+    if not row:
+        conn.execute("""INSERT INTO filings (accession, cik, ticker, name, sector, filing_date, acceptance, created_at)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                     (acc, company["cik"], company["ticker"], company["name"], company["sector"],
+                      filing["filing_date"], filing["acceptance"], datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    try:
+        log(f"Analizando {company['ticker']} ({filing['filing_date']})")
+        doc, url = fetch_press_release(company["cik"], filing)
+        analysis, tin, tout = analyze(company, filing, doc)
+        conn.execute("""UPDATE filings SET url=?, analysis=?, status='ok', attempts=attempts+1,
+                        input_tokens=?, output_tokens=? WHERE accession=?""",
+                     (url, json.dumps(analysis, ensure_ascii=False), tin, tout, acc))
+        conn.commit()
+        return {**company, "url": url, "analysis": analysis, "tin": tin, "tout": tout}
+    except Exception as e:
+        log(f"  error con {company['ticker']}: {e}")
+        conn.execute("UPDATE filings SET status='error', attempts=attempts+1 WHERE accession=?", (acc,))
+        conn.commit()
+        return None
+
+
+def run_check(conn):
+    companies = load_sp500(conn)
+    since = (datetime.now(timezone.utc).date() - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    log(f"Revisando {len(companies)} empresas (8-K item 2.02 desde {since})")
+    done, tin, tout = 0, 0, 0
+    for company in companies:
+        try:
+            filings = earnings_filings(company, since)
+        except Exception as e:
+            log(f"  {company['ticker']}: {e}")
+            continue
+        for filing in filings:
+            result = process(conn, company, filing)
+            if result:
+                done, tin, tout = done + 1, tin + result["tin"], tout + result["tout"]
+    log(f"Hecho: {done} resultados analizados · tokens entrada {tin:,} · salida {tout:,}")
+
+
+def run_summary(conn, dry_run=False):
+    rows = conn.execute("""SELECT accession, ticker, name, sector, filing_date, url, analysis FROM filings
+                           WHERE status='ok' AND summarized=0 ORDER BY sector, ticker""").fetchall()
+    if not rows:
+        log("No hay resultados nuevos para el resumen")
+        return
+    items = [{"accession": r[0], "ticker": r[1], "name": r[2], "sector": r[3], "filing_date": r[4],
+              "url": r[5], "analysis": json.loads(r[6])} for r in rows]
+
+    tones = [i["analysis"].get("tono") for i in items]
+    today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+    header = (f"📊 <b>Resultados S&amp;P 500 · {today}</b>\n"
+              f"{len(items)} empresas · 🟢 {tones.count('positivo')} · 🟡 {tones.count('neutro')} · "
+              f"🔴 {tones.count('negativo')}")
+
+    blocks = []
+    if len(items) >= 3:
+        try:
+            compact = [{"ticker": i["ticker"], "sector": i["sector"],
+                        **{k: i["analysis"].get(k) for k in
+                           ("crec_ingresos", "vs_consenso", "guidance", "guidance_detalle", "tono", "resumen", "alertas")}}
+                       for i in items]
+            reading, _, _ = claude(DAILY_PROMPT.format(data=json.dumps(compact, ensure_ascii=False)), MODEL_SMART, 800)
+            blocks.append("🧭 <b>Lectura del día</b>\n" + esc(reading.strip()))
+        except Exception as e:
+            log(f"Sin lectura del día: {e}")
+
+    by_sector = {}
+    for i in items:
+        by_sector.setdefault(i["sector"], []).append(i)
+    for sector, group in sorted(by_sector.items(), key=lambda kv: -len(kv[1])):
+        blocks.append(f"<b>— {esc(sector)} ({len(group)}) —</b>")
+        blocks.extend(company_line(i) for i in group)
+
+    send_blocks(header, blocks, dry_run)
+    if not dry_run:
+        conn.executemany("UPDATE filings SET summarized=1 WHERE accession=?", [(i["accession"],) for i in items])
+        conn.commit()
+    log(f"Resumen enviado: {len(items)} empresas")
+
+
+def run_ticker(conn, ticker, dry_run=False):
+    """Prueba: analiza el último resultado (últimos 120 días) de una empresa y lo envía."""
+    companies = load_sp500(conn)
+    company = next((c for c in companies if c["ticker"].upper() == ticker.upper()), None)
+    if not company:
+        sys.exit(f"{ticker} no está en el S&P 500")
+    since = (datetime.now(timezone.utc).date() - timedelta(days=120)).isoformat()
+    filings = earnings_filings(company, since)
+    if not filings:
+        sys.exit(f"No encuentro resultados de {ticker} en los últimos 120 días")
+    filing = max(filings, key=lambda f: f["filing_date"])
+    conn.execute("DELETE FROM filings WHERE accession=?", (filing["accession"],))  # fuerza el reanálisis
+    result = process(conn, company, filing)
+    if result:
+        send_telegram(company_detail(result), dry_run)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Resultados del S&P 500 por Telegram")
+    p.add_argument("--summary", action="store_true", help="envía el resumen de resultados pendientes")
+    p.add_argument("--ticker", help="analiza el último resultado de una empresa y lo envía")
+    p.add_argument("--test", action="store_true", help="mensaje de prueba a Telegram")
+    p.add_argument("--dry-run", action="store_true", help="imprime en pantalla en lugar de enviar")
+    args = p.parse_args()
+
+    if args.test:
+        send_telegram("✅ <b>Earnings Alerts</b> funcionando. Te llegará el resumen de resultados del S&amp;P 500 cada mañana.",
+                      args.dry_run)
+        return
+    missing = [n for n, v in (("SEC_USER_AGENT", SEC_USER_AGENT), ("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)) if not v]
+    if not args.summary and missing:
+        sys.exit(f"Faltan variables: {', '.join(missing)}")
+
+    conn = db_connect()
+    if args.ticker:
+        run_ticker(conn, args.ticker, args.dry_run)
+    elif args.summary:
+        run_summary(conn, args.dry_run)
+    else:
+        run_check(conn)
+
+
+if __name__ == "__main__":
+    main()
