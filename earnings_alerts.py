@@ -299,7 +299,7 @@ def eps_consensus(ticker, filing_date):
 
 
 # ---------------------------------------------------------------- Claude
-ANALYSIS_PROMPT = """Eres un analista de renta variable. Analiza el comunicado de resultados de {name} ({ticker}, sector {sector}), presentado a la SEC el {date}.
+ANALYSIS_PROMPT = """Eres un analista de renta variable. Analiza el comunicado de resultados de {name} ({ticker}, sector {sector}), publicado el {date}.
 {consensus_line}
 
 Registra tu análisis llamando a la herramienta "registrar_resultado". Si no puedes usarla, devuelve SOLO un JSON válido con esta estructura:
@@ -697,7 +697,8 @@ def company_detail(row):
     if a.get("alertas"):
         out.append("\n⚠️ <b>Alertas</b>\n" + "\n".join(f"• {esc(x)}" for x in a["alertas"]))
     if row.get("url"):
-        out.append(f"\n🔗 <a href=\"{esc(row['url'])}\">Comunicado en la SEC</a>")
+        where = " en la SEC" if "sec.gov" in row["url"] else ""
+        out.append(f"\n🔗 <a href=\"{esc(row['url'])}\">Comunicado{where}</a>")
     return "\n".join(out)
 
 
@@ -942,7 +943,12 @@ def watchlist_command(conn, text):
                 continue
             if _is_european(t):
                 current.append(t)
-                lines.append(f"• 🇪🇺 {esc(t)}: añadida (las europeas se activarán cuando montemos Europa)")
+                flag = EU_COUNTRY.get(t.rsplit(".", 1)[1], "🇪🇺")
+                if eu_supported(t):
+                    lines.append(f"• ✅ {flag} {esc(t)}: añadida (aviso al publicar resultados)")
+                else:
+                    lines.append(f"• {flag} {esc(t)}: añadida, pero aún no tengo fuente automática para ella. "
+                                 f"Si cotiza también en EE. UU. (ADR), añade ese ticker; si no, dímelo y la configuramos")
                 continue
             if sec_map is None:
                 sec_map = sec_ticker_map(conn)
@@ -1054,6 +1060,215 @@ def looks_like_results(text):
     return bool(RESULTS_RE.search(head))
 
 
+# ---------------------------------------------------------------- Europa
+# Fuentes de resultados para empresas europeas sin 6-K en la SEC.
+# - Londres (.L): Investegate, anuncios regulatorios (RNS) de cualquier empresa.
+# - Resto: la web de inversores de cada empresa (se vigila la aparición de enlaces nuevos).
+EU_SOURCES = {
+    "ADYEN.AS": {"name": "Adyen", "sector": "Europa · Pagos", "page": "https://investors.adyen.com/financials",
+                 "pattern": r"https?://(?:www\.)?adyen\.com/press-and-media/adyen-publishes-[^\"'#?]+|/financials/(?:q[1-4]|h[12])-20\d\d[^\"'#?]*"},
+    "MC.PA": {"name": "LVMH", "sector": "Europa · Lujo", "page": "https://www.lvmh.com/en/investors",
+              "pattern": r"/en/financial-calendar/20\d\d-[a-z0-9-]*(?:revenue|results)[a-z0-9-]*"},
+}
+EU_COUNTRY = {"L": "🇬🇧", "PA": "🇫🇷", "AS": "🇳🇱", "CO": "🇩🇰", "MC": "🇪🇸", "DE": "🇩🇪", "F": "🇩🇪", "MI": "🇮🇹",
+              "SW": "🇨🇭", "BR": "🇧🇪", "ST": "🇸🇪", "HE": "🇫🇮", "OL": "🇳🇴", "LS": "🇵🇹", "VI": "🇦🇹", "IR": "🇮🇪"}
+BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; earnings-alerts)",
+                   "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8", "Accept-Language": "en-GB,en;q=0.9"}
+RNS_RESULTS_RE = re.compile(r"results|trading (update|statement)|interim (report|management)|half[- ]year|"
+                            r"\bq[1-4]\b|quarter|preliminary|annual (financial )?report", re.I)
+RNS_NOT_RESULTS_RE = re.compile(r"notice of|date of|timing|conference call|webcast|presentation (details|of)|"
+                                r"transaction in own shares|holding\(s\)|director|voting rights|block listing", re.I)
+
+
+def eu_supported(ticker):
+    return ticker.endswith(".L") or ticker in EU_SOURCES
+
+
+def _web_get(url):
+    r = SESSION.get(url, headers=BROWSER_HEADERS, timeout=45)
+    r.raise_for_status()
+    return r
+
+
+def period_key(text):
+    """'q3-2026', 'h1-2026'… para no avisar dos veces del mismo periodo (Adyen enlaza nota y página)."""
+    t = text.lower()
+    m = re.search(r"\b(q[1-4]|h[12])[-_ ]?(20\d\d)", t) or re.search(r"(20\d\d)[-_ ](q[1-4]|h[12])\b", t)
+    if m:
+        a, b = m.groups()
+        return f"{a}-{b}" if a.startswith(("q", "h")) else f"{b}-{a}"
+    m = re.search(r"(20\d\d)[-_ ](?:first|1st)[-_ ]half", t)
+    if m:
+        return f"h1-{m.group(1)}"
+    m = re.search(r"(20\d\d)[-_ ](?:annual|full[-_ ]year)", t)
+    return f"fy-{m.group(1)}" if m else text
+
+
+def investegate_list(tidm):
+    """[(id, fecha, título, url)] de los anuncios RNS de una empresa de Londres."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(_web_get(f"https://www.investegate.co.uk/company/{tidm}").text, "lxml")
+    out = []
+    for a in soup.select("a.announcement-link"):
+        tds = a.find_parent("tr").find_all("td") if a.find_parent("tr") else []
+        date = tds[0].get_text(strip=True) if tds else ""
+        out.append((a["href"], date, a.get_text(" ", strip=True), a["href"]))
+    return out
+
+
+def investegate_text(url):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(_web_get(url).text, "lxml")
+    box = soup.select_one("div.news-window") or soup.select_one("div.aspose-root") or soup.body
+    return html_to_text(str(box))
+
+
+def ir_links(cfg):
+    """Enlaces de la web de inversores que encajan con el patrón de publicaciones de resultados."""
+    from urllib.parse import urljoin
+    html = _web_get(cfg["page"]).text
+    seen, out = set(), []
+    for m in re.finditer(cfg["pattern"], html, re.I):
+        url = urljoin(cfg["page"], m.group(0))
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def ir_document(url):
+    """Texto del documento de resultados: el PDF de la nota/carta si lo hay; si no, el texto de la página.
+    Devuelve (texto, url_documento) o (None, None) si todavía no está publicado."""
+    from urllib.parse import urljoin
+    r = _web_get(url)
+    if url.lower().endswith(".pdf") or "pdf" in r.headers.get("content-type", ""):
+        return document_to_text("doc.pdf", r.content), url
+    html = r.text
+    pdfs = list(dict.fromkeys(urljoin(url, u) for u in re.findall(r'["\']([^"\']+\.pdf)', html, re.I)))
+    rank = lambda u: (0 if re.search(r"press|release|communiqu|letter|update|results|revenue", u, re.I) else 1,
+                      1 if re.search(r"presentation|slides", u, re.I) else 0)
+    for pdf in sorted(pdfs, key=rank)[:2]:
+        try:
+            text = document_to_text("doc.pdf", _web_get(pdf).content)
+            if len(text) > 2000:
+                return text, pdf
+        except Exception as e:
+            log(f"  PDF no legible {pdf}: {e}")
+    text = html_to_text(html)
+    return (text, url) if len(text) > 6000 and RESULTS_RE.search(text) else (None, None)
+
+
+def eu_candidates(conn, ticker):
+    """Publicaciones nuevas de una empresa europea: [(clave, título, url)]. La primera vez solo guarda la línea base."""
+    key = f"eu_seen_{ticker}"
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    seen = set(json.loads(row[0])) if row else None
+    if ticker.endswith(".L"):
+        items = [(i, f"{t} ({d})", u) for i, d, t, u in investegate_list(ticker[:-2])
+                 if RNS_RESULTS_RE.search(t) and not RNS_NOT_RESULTS_RE.search(t)]
+    else:
+        items = [(period_key(u), u.rsplit("/", 1)[-1], u) for u in ir_links(EU_SOURCES[ticker])]
+    if seen is None:                       # primera vez: todo lo existente es historia
+        conn.execute("REPLACE INTO meta VALUES (?, ?, ?)",
+                     (key, json.dumps([i[0] for i in items]), datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        log(f"  {ticker}: línea base guardada ({len(items)} publicaciones anteriores)")
+        return []
+    new, keys = [], set()
+    for k, title, url in items:
+        if k not in seen and k not in keys:
+            keys.add(k)
+            new.append((k, title, url))
+    return new
+
+
+def eu_mark_seen(conn, ticker, k):
+    key = f"eu_seen_{ticker}"
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    seen = json.loads(row[0]) if row else []
+    seen.append(k)
+    conn.execute("REPLACE INTO meta VALUES (?, ?, ?)", (key, json.dumps(seen[-300:]), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+
+
+def eu_company(ticker):
+    cfg = EU_SOURCES.get(ticker, {})
+    suffix = ticker.rsplit(".", 1)[-1]
+    return {"ticker": ticker, "name": cfg.get("name", ticker.rsplit(".", 1)[0]), "cik": 0,
+            "sector": cfg.get("sector", f"Europa {EU_COUNTRY.get(suffix, '')}".strip())}
+
+
+def eu_analyze(conn, ticker, k, url, notify=True, dry_run=False):
+    """Descarga, analiza y avisa de una publicación europea. True si era de resultados y se ha enviado."""
+    company = eu_company(ticker)
+    if ticker.endswith(".L"):
+        text, doc_url = investegate_text(url), url
+    else:
+        text, doc_url = ir_document(url)
+        if not text:
+            log(f"  {ticker}: {url} aún sin documento; se reintenta más tarde")
+            return False
+    eu_mark_seen(conn, ticker, k)
+    if not looks_like_results(text) and not RESULTS_RE.search(text[:20000]):
+        log(f"  {ticker}: {url} no parece de resultados")
+        return False
+    today = datetime.now(timezone.utc).date().isoformat()
+    filing = {"accession": f"eu:{ticker}:{k}", "filing_date": today, "acceptance": datetime.now(timezone.utc).isoformat(),
+              "form": "EU"}
+    consensus = None
+    prompt = ANALYSIS_PROMPT.format(name=company["name"], ticker=ticker, sector=company["sector"], date=today,
+                                    consensus_line="No hay dato de consenso disponible.", doc=text[:MAX_DOC_CHARS])
+    msg = claude_message(prompt, MODEL_FAST, 4000, tools=[ANALYSIS_TOOL])
+    analysis = extract_analysis(msg)
+    if analysis.get("es_resultados") is False:
+        log(f"  {ticker}: Claude indica que no es de resultados")
+        return False
+    analysis["consenso_bpa"] = consensus
+    conn.execute("""REPLACE INTO filings (accession, cik, ticker, name, sector, filing_date, acceptance, url, analysis,
+                    status, attempts, input_tokens, output_tokens, created_at, notified, call_status)
+                    VALUES (?,?,?,?,?,?,?,?,?, 'ok', 1, ?, ?, ?, ?, 'manual')""",
+                 (filing["accession"], 0, ticker, company["name"], company["sector"], today, filing["acceptance"],
+                  doc_url, json.dumps(analysis, ensure_ascii=False), msg.usage.input_tokens, msg.usage.output_tokens,
+                  filing["acceptance"], 1 if notify else 0))
+    conn.commit()
+    if notify:
+        row = {**company, "filing_date": today, "url": doc_url, "analysis": analysis}
+        send_blocks("📢 <b>Resultados publicados</b>", [company_detail(row)], dry_run)
+    return True
+
+
+def run_europe(conn, dry_run=False):
+    tickers = sorted(t for t in WATCHLIST if eu_supported(t))
+    if not tickers:
+        return
+    log(f"Europa: revisando {', '.join(tickers)}")
+    for t in tickers:
+        try:
+            for k, title, url in eu_candidates(conn, t)[:3]:
+                log(f"  {t}: nueva publicación {title}")
+                eu_analyze(conn, t, k, url, dry_run=dry_run)
+        except Exception as e:
+            log(f"  Europa {t}: {e}")
+
+
+def run_eu_latest(conn, ticker, dry_run=False):
+    """Prueba: analiza la publicación de resultados más reciente de una empresa europea."""
+    ticker = ticker.upper()
+    if not eu_supported(ticker):
+        sys.exit(f"No tengo fuente para {ticker}")
+    eu_candidates(conn, ticker)            # guarda la línea base si es la primera vez
+    if ticker.endswith(".L"):
+        items = [(i, t, u) for i, d, t, u in investegate_list(ticker[:-2])
+                 if RNS_RESULTS_RE.search(t) and not RNS_NOT_RESULTS_RE.search(t)]
+    else:
+        items = [(period_key(u), u, u) for u in ir_links(EU_SOURCES[ticker])]
+    for k, title, url in items[:4]:
+        log(f"Probando {title}")
+        if eu_analyze(conn, ticker, k, url, dry_run=dry_run):
+            return
+    send_telegram(f"⚠️ No he encontrado una publicación de resultados reciente de <b>{esc(ticker)}</b>.", dry_run)
+
+
 # ---------------------------------------------------------------- flujos principales
 def process(conn, company, filing):
     """Descarga y analiza un filing; guarda el resultado. Devuelve la fila o None."""
@@ -1135,6 +1350,7 @@ def run_check(conn):
         lines = "\n".join(f"• {esc(e[:150])}" for e in errors[:10])
         more = f"\n… y {len(errors) - 10} más" if len(errors) > 10 else ""
         send_telegram(f"⚠️ <b>Earnings Alerts</b>: {len(errors)} análisis fallidos (se reintentan solos)\n{lines}{more}")
+    run_europe(conn)
     if ALPHAVANTAGE_API_KEY:
         run_calls(conn)
 
@@ -1291,6 +1507,7 @@ def main():
     p.add_argument("--ticker", help="analiza el último resultado de una empresa y lo envía")
     p.add_argument("--call", help="analiza el último resultado de una empresa junto con su call")
     p.add_argument("--inbox", action="store_true", help="analiza las transcripciones enviadas al bot por Telegram")
+    p.add_argument("--eu", help="analiza la última publicación de resultados de una empresa europea (p. ej. LSEG.L)")
     p.add_argument("--test", action="store_true", help="mensaje de prueba a Telegram")
     p.add_argument("--dry-run", action="store_true", help="imprime en pantalla en lugar de enviar")
     args = p.parse_args()
@@ -1309,7 +1526,9 @@ def main():
         sys.exit(f"Faltan variables: {', '.join(missing)}")
 
     conn = db_connect()
-    if args.call:
+    if args.eu:
+        run_eu_latest(conn, args.eu, args.dry_run)
+    elif args.call:
         run_call_now(conn, args.call, args.dry_run)
     elif args.ticker:
         run_ticker(conn, args.ticker, args.dry_run)

@@ -60,6 +60,13 @@ Las empresas de tu watchlist (archivo `watchlist.txt`) tienen trato especial:
 Para añadir o quitar empresas, escríbele al bot por Telegram: `/añadir AMZN`, `/quitar NKE` o `/lista` (se aplica en unos 10 minutos). La lista se guarda en `watchlist.txt`.
 Para probarlo a mano: **Run workflow** con **mode** = `call` y **ticker** = el que quieras.
 
+## Empresas europeas
+Se añaden a la watchlist con su sufijo de bolsa y reciben el aviso al publicar resultados (la call, enviando la transcripción por Telegram):
+- **Londres** (`.L`, p. ej. `LSEG.L`, `BARC.L`): cualquier empresa, leyendo sus anuncios regulatorios (RNS) en Investegate.
+- **Con fuente configurada** en `EU_SOURCES` (dentro de `earnings_alerts.py`): `ADYEN.AS` y `MC.PA` (LVMH), vigilando su web de inversores.
+- **Con ADR en EE. UU.** (Novo `NVO`, Grifols `GRFS`, `ASML`, `SAP`…): mejor añadir el ticker americano, porque se siguen sus 6-K en la SEC.
+- La primera vez que el bot ve una empresa europea guarda lo ya publicado como histórico y solo avisa de lo nuevo. Para probar: **Run workflow** con **mode** = `eu` y **ticker** = `LSEG.L`.
+
 ## Analizar cualquier call enviándola por Telegram (TIKR)
 Para empresas que el bot no cubre solo (europeas, TSMC, Spotify…): descarga la transcripción, por ejemplo desde TIKR, y **envíala como archivo** (PDF, TXT o Word) al bot de resultados. Opcionalmente, escribe el ticker en el texto del archivo.
 - El bot revisa sus mensajes cada 10 minutos (tarea `telegram-inbox`), te responde "📥 Recibido" y después el análisis.
