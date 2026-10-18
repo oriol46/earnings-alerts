@@ -230,9 +230,10 @@ ANALYSIS_PROMPT = """Eres un analista de renta variable. Analiza el comunicado d
 Registra tu análisis llamando a la herramienta "registrar_resultado". Si no puedes usarla, devuelve SOLO un JSON válido con esta estructura:
 {{
   "periodo": "trimestre y año fiscal, p. ej. '3T FY2026'",
-  "ingresos": "cifra con unidad, p. ej. '94,9 mil M$'",
-  "crec_ingresos": "variación interanual, p. ej. '+8%', o null",
-  "bpa": "BPA ajustado si existe, con '(GAAP)' si solo hay GAAP, p. ej. '1,85 $'",
+  "ingresos_musd": número: ingresos totales del trimestre en MILLONES de dólares (p. ej. 94930.0 para 94,93 mil M$), o null,
+  "crec_ingresos_pct": número: variación interanual de esos ingresos en % (p. ej. 8.2 o -3.1), o null,
+  "bpa": número: BPA diluido del trimestre en $ (ajustado si la empresa lo da; si no, GAAP), o null,
+  "bpa_tipo": "ajustado" | "GAAP",
   "vs_consenso": "bate" | "en linea" | "decepciona" | "sin consenso",
   "guidance": "sube" | "mantiene" | "baja" | "inicia" | "retira" | "no da",
   "guidance_detalle": "una frase con las cifras, o null",
@@ -243,7 +244,8 @@ Registra tu análisis llamando a la herramienta "registrar_resultado". Si no pue
 }}
 
 Reglas:
-- Español con formato numérico español. Usa solo datos del documento (y el consenso indicado); no inventes; si un dato no aparece, null.
+- Español con formato numérico español en los textos. Usa solo datos del documento (y el consenso indicado); no inventes; si un dato no aparece, null.
+- Ingresos: una sola cifra, la de ingresos totales que la empresa destaca (en bancos, ingresos netos totales; en aseguradoras, ingresos totales). Revisa las unidades de las tablas ("in millions", "in thousands") antes de convertir a millones.
 - "vs_consenso": compara el BPA ajustado con el consenso indicado ("en linea" si la diferencia es menor del 2%); "sin consenso" si no se te ha dado.
 - "tono" refleja la calidad del trimestre y del guidance, no el lenguaje de la empresa.
 - "alertas" es SOLO para hechos excepcionales que un gestor deba conocer aunque no siga la empresa: recorte o suspensión del dividendo, subida del dividendo superior al 20%, programa de recompra NUEVO de más del 5% de la capitalización, salida o cambio de CEO/CFO, deterioros o provisiones extraordinarias, reformulación de cuentas, adquisición o desinversión relevante anunciada, reestructuración con despidos, investigación regulatoria o litigio material. NO son alertas: recompras o dividendos ordinarios, provisiones habituales del negocio, caídas de un segmento, variaciones normales de márgenes. Máximo 2. En la gran mayoría de trimestres la lista debe estar vacía.
@@ -268,9 +270,10 @@ ANALYSIS_TOOL = {
         "type": "object",
         "properties": {
             "periodo": _nullable("string"),
-            "ingresos": _nullable("string"),
-            "crec_ingresos": _nullable("string"),
-            "bpa": _nullable("string"),
+            "ingresos_musd": {"type": ["number", "null"], "description": "Ingresos totales en millones de $"},
+            "crec_ingresos_pct": {"type": ["number", "null"], "description": "Variación interanual en %"},
+            "bpa": {"type": ["number", "null"], "description": "BPA diluido en $"},
+            "bpa_tipo": {"type": "string", "enum": ["ajustado", "GAAP"]},
             "vs_consenso": {"type": "string", "enum": ["bate", "en linea", "decepciona", "sin consenso"]},
             "guidance": {"type": "string", "enum": ["sube", "mantiene", "baja", "inicia", "retira", "no da"]},
             "guidance_detalle": _nullable("string"),
@@ -280,7 +283,8 @@ ANALYSIS_TOOL = {
             "tono": {"type": "string", "enum": ["positivo", "neutro", "negativo"]},
             "resumen": {"type": "string"},
         },
-        "required": ["periodo", "ingresos", "bpa", "guidance", "destacados", "alertas", "tono", "resumen"],
+        "required": ["periodo", "ingresos_musd", "bpa", "bpa_tipo", "guidance", "destacados", "alertas", "tono",
+                     "resumen"],
     },
 }
 
@@ -369,19 +373,46 @@ GUIDE_TXT = {"sube": "⬆️ sube", "mantiene": "➡️ mantiene", "baja": "⬇�
              "inicia": "🆕 inicia", "retira": "⛔ retira", "no da": "— no da"}
 
 
+def _es(x, decimals):
+    """Número con formato español: 12.412,5"""
+    s = f"{x:,.{decimals}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 def _money(x):
-    return f"{x:.2f} $".replace(".", ",")
+    return f"{_es(x, 2)} $"
+
+
+def _name(row):
+    return re.sub(r"\s*\(The\)$", "", row["name"])
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def _revenue(a):
-    rev = esc(a.get("ingresos")) or "—"
-    if a.get("crec_ingresos"):
+    musd = a.get("ingresos_musd")
+    if _num(musd):
+        rev = f"{_es(musd / 1000, 1)} mil M$" if abs(musd) >= 10000 else f"{_es(musd, 0)} M$"
+    else:
+        rev = esc(a.get("ingresos")) or "—"  # formato antiguo
+    pct = a.get("crec_ingresos_pct")
+    if _num(pct):
+        rev += f" ({'+' if pct > 0 else ''}{_es(pct, 1)}% a/a)"
+    elif a.get("crec_ingresos"):
         rev += f" ({esc(a['crec_ingresos'])} a/a)"
     return rev
 
 
+def _eps_value(a):
+    if _num(a.get("bpa")):
+        return _money(a["bpa"]) + (" (GAAP)" if a.get("bpa_tipo") == "GAAP" else "")
+    return esc(a.get("bpa")) or "—"
+
+
 def _eps(a, with_consensus=True):
-    eps = esc(a.get("bpa")) or "—"
+    eps = _eps_value(a)
     if with_consensus and a.get("consenso_bpa") is not None:
         eps += f" vs {_money(a['consenso_bpa'])} est."
     if a.get("vs_consenso") in VS:
@@ -393,7 +424,7 @@ def company_line(row):
     """Bloque compacto para el resumen diario."""
     a = row["analysis"]
     lines = [f"{TONE.get(a.get('tono'), '⚪')} <a href=\"{esc(row['url'])}\"><b>{esc(row['ticker'])}</b></a>"
-             f" · {esc(row['name'])} · {esc(a.get('periodo'))}",
+             f" · {esc(_name(row))} · {esc(a.get('periodo'))}",
              f"Ingresos {_revenue(a)}",
              f"BPA {_eps(a)} · Guía {GUIDE.get(a.get('guidance'), '—').replace('Guía ', '')}"]
     if a.get("resumen"):
@@ -409,10 +440,10 @@ def company_detail(row):
     date = row.get("filing_date") or ""
     if date:
         date = f" · publicado {date[8:10]}/{date[5:7]}"
-    out = [f"{TONE.get(a.get('tono'), '⚪')} <b>{esc(row['ticker'])} · {esc(row['name'])}</b>",
+    out = [f"{TONE.get(a.get('tono'), '⚪')} <b>{esc(row['ticker'])} · {esc(_name(row))}</b>",
            f"{esc(row.get('sector', ''))} · {esc(a.get('periodo'))}{date}"]
 
-    figures = [f"Ingresos: {_revenue(a)}", f"BPA: {esc(a.get('bpa')) or '—'}"]
+    figures = [f"Ingresos: {_revenue(a)}", f"BPA: {_eps_value(a)}"]
     if a.get("consenso_bpa") is not None:
         verdict = VS_TXT.get(a.get("vs_consenso"))
         figures.append(f"Consenso BPA: {_money(a['consenso_bpa'])}" + (f" → {verdict}" if verdict else ""))
@@ -516,7 +547,7 @@ def run_summary(conn, dry_run=False):
         try:
             compact = [{"ticker": i["ticker"], "sector": i["sector"],
                         **{k: i["analysis"].get(k) for k in
-                           ("crec_ingresos", "vs_consenso", "guidance", "guidance_detalle", "tono", "resumen", "alertas")}}
+                           ("ingresos_musd", "crec_ingresos_pct", "crec_ingresos", "vs_consenso", "guidance", "guidance_detalle", "tono", "resumen", "alertas")}}
                        for i in items]
             reading, _, _ = claude(DAILY_PROMPT.format(data=json.dumps(compact, ensure_ascii=False)), MODEL_SMART, 800)
             blocks.append("🧭 <b>Lectura del día</b>\n" + esc(reading.strip()))
