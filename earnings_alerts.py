@@ -786,18 +786,72 @@ def document_blocks(d):
 
 
 HELP_TEXT = ("🎙️ <b>Análisis de calls</b>\n"
-             "Envíame la transcripción como <b>archivo</b> (PDF, TXT o Word), por ejemplo descargada de TIKR, "
-             "y te devuelvo el análisis en unos minutos.\n"
-             "Opcional: escribe el ticker o una indicación en el texto del archivo (p. ej. <i>NOVO 3T26</i>).")
+             "• <b>Pega la transcripción</b> directamente aquí (aunque Telegram la parta en varios mensajes, "
+             "la junto yo), o\n"
+             "• envíamela como <b>archivo</b> (PDF, TXT o Word).\n"
+             "Opcional: escribe antes el ticker en un mensaje corto (p. ej. <i>NOVO 3T26</i>). "
+             "Escribe <i>analiza</i> si no quieres esperar.")
+
+PASTE_MIN_CHARS = 300        # un mensaje más largo se considera parte de una transcripción pegada
+PASTE_QUIET_SECONDS = 60     # se analiza cuando lleva este tiempo sin llegar texto nuevo
+
+
+def _get_buffer(conn):
+    row = conn.execute("SELECT value FROM meta WHERE key='tg_buffer'").fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _set_buffer(conn, buf):
+    if buf is None:
+        conn.execute("DELETE FROM meta WHERE key='tg_buffer'")
+    else:
+        conn.execute("REPLACE INTO meta VALUES ('tg_buffer', ?, ?)",
+                     (json.dumps(buf, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+
+
+def _set_hint(conn, text):
+    conn.execute("REPLACE INTO meta VALUES ('tg_hint', ?, ?)", (text, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+
+
+def _pop_hint(conn):
+    """Ticker o indicación escrita antes de la transcripción (válida 30 minutos)."""
+    row = conn.execute("SELECT value, updated FROM meta WHERE key='tg_hint'").fetchone()
+    conn.execute("DELETE FROM meta WHERE key='tg_hint'")
+    conn.commit()
+    if row and datetime.now(timezone.utc) - datetime.fromisoformat(row[1]) < timedelta(minutes=30):
+        return row[0]
+    return ""
+
+
+def _analyze_and_send(text, hint, label, dry_run):
+    try:
+        if len(text) < 2000:
+            raise ValueError("hay muy poco texto para ser una transcripción completa")
+        log(f"Analizando {label} ({len(text):,} caracteres)")
+        analysis = analyze_document(text, hint)
+        send_blocks("🎙️ <b>Análisis de la call</b>", document_blocks(analysis), dry_run)
+    except Exception as e:
+        log(f"Error con {label}: {e}")
+        send_telegram(f"⚠️ No he podido analizar {esc(label)}: {esc(str(e)[:300])}", dry_run)
+
+
+def _flush_buffer(conn, dry_run, force=False):
+    buf = _get_buffer(conn)
+    if not buf:
+        return
+    if not force and time.time() - buf["last"] < PASTE_QUIET_SECONDS:
+        return  # aún puede estar llegando texto; se analiza en la próxima revisión
+    _set_buffer(conn, None)
+    _analyze_and_send("\n".join(buf["parts"]), buf.get("hint", ""), "el texto pegado", dry_run)
 
 
 def run_inbox(conn, dry_run=False):
-    """Lee los mensajes nuevos del bot y analiza los documentos enviados desde tu chat."""
+    """Lee los mensajes nuevos del bot: archivos o texto pegado con transcripciones de calls."""
     row = conn.execute("SELECT value FROM meta WHERE key='tg_offset'").fetchone()
     offset = int(row[0]) if row else 0
     updates = telegram_api("getUpdates", offset=offset, timeout=0, allowed_updates='["message"]')
-    if not updates:
-        return
     for upd in updates:
         conn.execute("REPLACE INTO meta VALUES ('tg_offset', ?, ?)",
                      (str(upd["update_id"] + 1), datetime.now(timezone.utc).isoformat()))
@@ -806,10 +860,35 @@ def run_inbox(conn, dry_run=False):
         if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
             log(f"Mensaje ignorado de otro chat: {msg.get('chat', {}).get('id')}")
             continue
+
+        text = (msg.get("text") or "").strip()
+        if text:
+            buf = _get_buffer(conn)
+            if len(text) >= PASTE_MIN_CHARS:                       # trozo de una transcripción pegada
+                if not buf:
+                    buf = {"parts": [], "hint": _pop_hint(conn), "last": 0}
+                    send_telegram("📝 Recibiendo la transcripción…", dry_run)
+                buf["parts"].append(text)
+                buf["last"] = msg.get("date") or time.time()
+                _set_buffer(conn, buf)
+            elif text.lower().lstrip("/") in ("analiza", "analizar", "fin", "ya"):
+                if buf:
+                    _flush_buffer(conn, dry_run, force=True)
+                else:
+                    send_telegram("No tengo ningún texto pendiente. " + HELP_TEXT, dry_run)
+            elif buf:                                              # mensaje corto: ticker o indicación
+                buf["hint"] = (buf.get("hint", "") + " " + text).strip()
+                _set_buffer(conn, buf)
+            elif text.lower().lstrip("/") in ("start", "ayuda", "help", "hola"):
+                send_telegram(HELP_TEXT, dry_run)
+            else:                                                  # ticker antes de pegar o enviar el archivo
+                _set_hint(conn, text)
+                send_telegram(f"📌 Anotado: <i>{esc(text)}</i>. Ahora pega la transcripción o envía el archivo.",
+                              dry_run)
+            continue
+
         doc = msg.get("document")
         if not doc:
-            if msg.get("text"):
-                send_telegram(HELP_TEXT, dry_run)
             continue
         name = doc.get("file_name") or "documento"
         if not name.lower().endswith(DOC_EXTENSIONS):
@@ -820,15 +899,14 @@ def run_inbox(conn, dry_run=False):
             continue
         send_telegram(f"📥 Recibido <b>{esc(name)}</b>. Analizando la call…", dry_run)
         try:
-            text = document_to_text(name, download_telegram_file(doc["file_id"]))
-            if len(text) < 2000:
-                raise ValueError("el documento tiene muy poco texto; si es un PDF escaneado, envíalo como TXT")
-            log(f"Analizando documento {name} ({len(text):,} caracteres)")
-            analysis = analyze_document(text, (msg.get("caption") or "").strip())
-            send_blocks("🎙️ <b>Análisis de la call</b>", document_blocks(analysis), dry_run)
+            content = document_to_text(name, download_telegram_file(doc["file_id"]))
         except Exception as e:
-            log(f"Error con {name}: {e}")
-            send_telegram(f"⚠️ No he podido analizar <b>{esc(name)}</b>: {esc(str(e)[:300])}", dry_run)
+            send_telegram(f"⚠️ No he podido leer <b>{esc(name)}</b>: {esc(str(e)[:300])}", dry_run)
+            continue
+        hint = (msg.get("caption") or "").strip() or _pop_hint(conn)
+        _analyze_and_send(content, hint, name, dry_run)
+
+    _flush_buffer(conn, dry_run)
 
 
 # ---------------------------------------------------------------- flujos principales
