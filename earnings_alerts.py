@@ -412,7 +412,11 @@ CALL_PROMPT = """Eres un gestor de renta variable fundamental. Tienes el anális
 ANÁLISIS DEL COMUNICADO:
 {analysis}
 
-Analiza la call y registra el resultado con la herramienta "registrar_call". Céntrate en lo que la call AÑADE al comunicado: matices de la directiva, explicaciones, cambios de mensaje y el turno de preguntas. Escribe en español, frases cortas y concretas con cifras cuando las haya. No inventes nada que no esté en la transcripción.
+Analiza la call y registra el resultado con la herramienta "registrar_call". Céntrate en lo que la call AÑADE al comunicado: matices de la directiva, explicaciones, cambios de mensaje y el turno de preguntas. Escribe en español, concreto y con cifras cuando las haya. No inventes nada que no esté en la transcripción.
+
+Prioriza la exhaustividad sobre la brevedad: es preferible un punto de más que dejarse algo relevante para un inversor (cambios en guidance o en el mensaje, KPIs, capital, márgenes, demanda, competencia, regulación, M&A, riesgos).
+
+Cuando cites a alguien, usa siempre nombre, apellido y cargo, por ejemplo "Ted Pick (CEO)" o "Sharon Yeshaya (CFO)"; para analistas, nombre y banco. Nunca solo el nombre de pila.
 
 Primero comprueba si la transcripción corresponde a ESE trimestre (por las cifras y las fechas que se mencionan). Si es de otro trimestre, marca "corresponde": false y rellena el resto con lo mínimo.
 
@@ -427,23 +431,26 @@ CALL_TOOL = {
         "properties": {
             "corresponde": {"type": "boolean", "description": "La transcripción es del trimestre indicado"},
             "tono": {"type": "string", "enum": ["confiado", "neutral", "prudente", "defensivo"]},
-            "tono_explicacion": {"type": "string", "description": "Máximo 25 palabras"},
-            "mensajes_clave": {"type": "array", "items": {"type": "string"}, "maxItems": 3,
-                               "description": "Lo nuevo que no estaba en el comunicado; máximo 25 palabras cada uno"},
+            "tono_explicacion": {"type": "string", "description": "1-2 frases"},
+            "mensajes_clave": {"type": "array", "items": {"type": "string"}, "maxItems": 6,
+                               "description": "Todo lo relevante que no estaba en el comunicado (normalmente 3-6 puntos)"},
             "guidance_call": {"type": ["string", "null"],
-                              "description": "Matices sobre el guidance dados en la call, o null"},
-            "preguntas": {"type": "array", "maxItems": 3, "items": {
+                              "description": "Matices sobre el guidance dados en la call, con cifras, o null"},
+            "preguntas": {"type": "array", "maxItems": 6, "items": {
                 "type": "object",
                 "properties": {"tema": {"type": "string"},
                                "respuesta": {"type": "string", "enum": ["clara", "vaga", "evasiva"]},
-                               "detalle": {"type": "string", "description": "Máximo 25 palabras"}},
+                               "detalle": {"type": "string",
+                                           "description": "Qué respondió y quién (nombre y cargo), 1-2 frases"}},
                 "required": ["tema", "respuesta", "detalle"]},
-                "description": "Las preguntas de analistas más relevantes y cómo respondió la directiva"},
-            "riesgos": {"type": "array", "items": {"type": "string"}, "maxItems": 2,
+                "description": "Las preguntas de analistas relevantes (normalmente 3-6) y cómo respondió la directiva"},
+            "riesgos": {"type": "array", "items": {"type": "string"}, "maxItems": 4,
                         "description": "Riesgos o señales de alerta mencionados; vacío si no hay"},
             "impacto": {"type": "string", "enum": ["mejora", "confirma", "empeora"],
                         "description": "Si la call mejora, confirma o empeora la lectura del comunicado"},
-            "balance": {"type": "string", "description": "Una frase de máximo 25 palabras"},
+            "balance": {"type": "string",
+                        "description": "1-2 frases con el matiz principal que aporta la call. No empieces repitiendo "
+                                       "'confirma/mejora/empeora' ni 'la call', ve directo al contenido"},
         },
         "required": ["corresponde", "tono", "tono_explicacion", "mensajes_clave", "preguntas", "riesgos",
                      "impacto", "balance"],
@@ -456,7 +463,7 @@ def analyze_call(row, transcript):
     prompt = CALL_PROMPT.format(name=row["name"], ticker=row["ticker"], periodo=a.get("periodo"),
                                 date=row["filing_date"], analysis=json.dumps(a, ensure_ascii=False),
                                 transcript=transcript)
-    msg = claude_message(prompt, MODEL_SMART, 4000, tools=[CALL_TOOL])
+    msg = claude_message(prompt, MODEL_SMART, 8000, tools=[CALL_TOOL])
     for block in msg.content:
         if getattr(block, "type", "") == "tool_use" and block.name == CALL_TOOL["name"]:
             return dict(block.input)
@@ -600,28 +607,29 @@ IMPACT = {"mejora": "⬆️ Mejora", "confirma": "➡️ Confirma", "empeora": "
 
 
 def call_section(c):
-    out = [f"🎙️ <b>La call</b> · tono {CALL_TONE.get(c.get('tono'), esc(c.get('tono')))}"]
+    """Sección de la call como lista de bloques (para poder partir mensajes largos sin romper nada)."""
+    head = f"🎙️ <b>La call</b> · tono {CALL_TONE.get(c.get('tono'), esc(c.get('tono')))}"
     if c.get("tono_explicacion"):
-        out.append(f"<i>{esc(c['tono_explicacion'])}</i>")
+        head += f"\n<i>{esc(c['tono_explicacion'])}</i>"
+    blocks = [head]
     if c.get("mensajes_clave"):
-        out.append("\n<b>Mensajes clave</b>\n" + "\n".join(f"• {esc(m)}" for m in c["mensajes_clave"]))
+        blocks.append("<b>Mensajes clave</b>\n" + "\n".join(f"• {esc(m)}" for m in c["mensajes_clave"]))
     if c.get("guidance_call"):
-        out.append(f"\n<b>Guidance en la call:</b> {esc(c['guidance_call'])}")
-    if c.get("preguntas"):
-        out.append("\n<b>Preguntas de analistas</b>\n" + "\n".join(
-            f"{ANSWER.get(p.get('respuesta'), '⚪')} <b>{esc(p.get('tema'))}</b>: {esc(p.get('detalle'))}"
-            for p in c["preguntas"]))
+        blocks.append(f"<b>Guidance en la call:</b> {esc(c['guidance_call'])}")
+    for i, p in enumerate(c.get("preguntas") or []):
+        line = f"{ANSWER.get(p.get('respuesta'), '⚪')} <b>{esc(p.get('tema'))}</b>: {esc(p.get('detalle'))}"
+        blocks.append(("<b>Preguntas de analistas</b>\n" if i == 0 else "") + line)
     if c.get("riesgos"):
-        out.append("\n<b>Riesgos</b>\n" + "\n".join(f"• {esc(r)}" for r in c["riesgos"]))
-    out.append(f"\n📌 <b>{IMPACT.get(c.get('impacto'), 'Balance')}</b> la lectura del comunicado: "
-               f"{esc(c.get('balance'))}")
-    return "\n".join(out)
+        blocks.append("<b>Riesgos</b>\n" + "\n".join(f"• {esc(r)}" for r in c["riesgos"]))
+    blocks.append(f"📌 <b>{IMPACT.get(c.get('impacto'), 'Balance')}</b> la lectura del comunicado. "
+                  f"{esc(c.get('balance'))}")
+    return blocks
 
 
 def send_full_update(row, dry_run=False):
     """Mensaje completo de resultados + sección de la call, sin partir bloques."""
     header = "🎙️ <b>Actualización tras la call</b>"
-    send_blocks(header, [company_detail(row), call_section(row["call"])], dry_run)
+    send_blocks(header, [company_detail(row), *call_section(row["call"])], dry_run)
 
 
 # ---------------------------------------------------------------- flujos principales
