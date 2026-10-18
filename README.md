@@ -1,6 +1,6 @@
 # Earnings Alerts — resultados del S&P 500 por Telegram
 
-Revisa cada 30 minutos (en horario de mercado de EE. UU.) los comunicados de resultados que las empresas del S&P 500 presentan a la SEC (8-K, item 2.02). Cada uno lo analiza Claude Haiku: ventas, crecimiento, BPA frente al consenso, guidance, destacados y alertas (dividendo, recompras, cambio de CEO…).
+Revisa cada 30 minutos, de lunes a viernes entre las 6:00 y las 19:30 de Nueva York (incluye pre-market y after-hours), los comunicados de resultados que las empresas del S&P 500 presentan a la SEC (8-K, item 2.02). Cada uno lo analiza Claude Haiku: ventas, crecimiento, BPA frente al consenso, guidance, destacados y alertas (dividendo, recompras, cambio de CEO…).
 
 Cada mañana de martes a sábado te llega **un resumen por Telegram** con:
 - Cabecera con el número de empresas y el reparto 🟢 / 🟡 / 🔴.
@@ -59,6 +59,11 @@ Las empresas de la línea `WATCHLIST` del archivo `.yml` (por defecto UBER, NFLX
 
 Para añadir o quitar empresas, edita esa línea en GitHub (tickers del S&P 500 separados por comas).
 Para probarlo a mano: **Run workflow** con **mode** = `call` y **ticker** = el que quieras.
+
+## Analizar cualquier call enviándola por Telegram (TIKR)
+Para empresas que el bot no cubre solo (europeas, TSMC, Spotify…): descarga la transcripción, por ejemplo desde TIKR, y **envíala como archivo** (PDF, TXT o Word) al bot de resultados. Opcionalmente, escribe el ticker en el texto del archivo.
+- El bot revisa sus mensajes cada 10 minutos (tarea `telegram-inbox`), te responde "📥 Recibido" y después el análisis.
+- Solo atiende mensajes de tu chat.
 
 ## Coste
 - GitHub Actions: gratis (repositorio público).

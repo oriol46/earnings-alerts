@@ -4,3 +4,5 @@ lxml>=5.0
 beautifulsoup4>=4.12
 anthropic>=0.40
 yfinance>=0.2.50
+pypdf>=4.0
+python-docx>=1.1

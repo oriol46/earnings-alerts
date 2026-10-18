@@ -686,6 +686,151 @@ def send_full_update(row, dry_run=False):
     send_blocks(header, [company_detail(row), *call_section(row["call"])], dry_run)
 
 
+# ---------------------------------------------------------------- buzón: transcripciones enviadas por Telegram
+import copy
+
+DOC_PROMPT = """Eres un gestor de renta variable fundamental. Te paso la transcripción de una conference call de resultados (descargada de TIKR u otra fuente). {hint}
+
+Analízala y registra el resultado con la herramienta "registrar_call_documento". Escribe en español, concreto y con cifras cuando las haya. No inventes nada que no esté en el documento.
+
+Cobertura y concisión:
+- Identifica la empresa, su ticker y el trimestre.
+- "cifras": las cifras clave del trimestre que da la directiva (ventas, crecimiento orgánico, márgenes, BPA, caja, KPIs del sector), con su variación.
+- No omitas ningún TEMA relevante para un inversor (guidance, cambios de mensaje, KPIs, capital, márgenes, demanda, competencia, regulación, M&A, riesgos), pero cada punto en 1-2 frases densas con las 2-3 cifras que importan.
+- No repitas información entre secciones. La sección completa debe ocupar unas 350-500 palabras.
+- Cuando cites a alguien, usa nombre, apellido y cargo, p. ej. "Lars Fruergaard Jørgensen (CEO)"; para analistas, nombre y banco.
+
+DOCUMENTO:
+{text}"""
+
+DOC_TOOL = copy.deepcopy(CALL_TOOL)
+DOC_TOOL["name"] = "registrar_call_documento"
+DOC_TOOL["description"] = "Registra el análisis de una conference call enviada como documento."
+_props = DOC_TOOL["input_schema"]["properties"]
+_props.pop("corresponde", None)
+_props.pop("impacto", None)
+_props.update({
+    "empresa": {"type": "string"},
+    "ticker": {"type": ["string", "null"]},
+    "periodo": {"type": "string", "description": "Trimestre y año, p. ej. '3T 2026'"},
+    "cifras": {"type": "array", "items": {"type": "string"}, "maxItems": 6,
+               "description": "Cifras clave del trimestre dadas en la call, una por punto, máximo 20 palabras"},
+    "lectura": {"type": "string", "enum": ["positiva", "neutra", "negativa"],
+                "description": "Lectura global del trimestre según la call"},
+})
+_props["balance"]["description"] = "Una frase, máximo 35 palabras, con la conclusión principal para un inversor"
+DOC_TOOL["input_schema"]["required"] = ["empresa", "periodo", "cifras", "tono", "tono_explicacion",
+                                        "mensajes_clave", "preguntas", "riesgos", "lectura", "balance"]
+
+DOC_EXTENSIONS = (".pdf", ".txt", ".md", ".docx", ".htm", ".html")
+MAX_DOC_BYTES = 20 * 1024 * 1024  # límite de descarga de los bots de Telegram
+
+
+def telegram_api(method, **params):
+    r = SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}", data=params, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram {method}: {data}")
+    return data["result"]
+
+
+def download_telegram_file(file_id):
+    info = telegram_api("getFile", file_id=file_id)
+    r = SESSION.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}", timeout=120)
+    r.raise_for_status()
+    return r.content
+
+
+def document_to_text(name, content):
+    """Texto de un PDF, Word, HTML o texto plano."""
+    low = name.lower()
+    if low.endswith(".pdf"):
+        from pypdf import PdfReader
+        from io import BytesIO
+        reader = PdfReader(BytesIO(content))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif low.endswith(".docx"):
+        from docx import Document
+        from io import BytesIO
+        text = "\n".join(p.text for p in Document(BytesIO(content)).paragraphs)
+    elif low.endswith((".htm", ".html")):
+        text = html_to_text(content.decode("utf-8", errors="ignore"))
+    else:
+        text = content.decode("utf-8", errors="ignore")
+    text = re.sub(r"[ \t\xa0]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
+
+
+def analyze_document(text, hint):
+    prompt = DOC_PROMPT.format(hint=f"Indicación del usuario: {hint}." if hint else "", text=text[:MAX_TRANSCRIPT_CHARS])
+    msg = claude_message(prompt, MODEL_SMART, 5000, tools=[DOC_TOOL])
+    for block in msg.content:
+        if getattr(block, "type", "") == "tool_use" and block.name == DOC_TOOL["name"]:
+            return dict(block.input)
+    raise ValueError(f"Claude no devolvió el análisis (stop_reason={msg.stop_reason})")
+
+
+READING = {"positiva": "🟢", "neutra": "🟡", "negativa": "🔴"}
+
+
+def document_blocks(d):
+    ticker = f" ({esc(d['ticker'])})" if d.get("ticker") else ""
+    head = (f"{READING.get(d.get('lectura'), '⚪')} <b>{esc(d.get('empresa'))}{ticker}</b> · {esc(d.get('periodo'))}")
+    blocks = [head]
+    if d.get("cifras"):
+        blocks.append("📊 <b>Cifras de la call</b>\n" + "\n".join(f"• {esc(x)}" for x in d["cifras"]))
+    call = call_section(d)
+    call[-1] = f"📌 <b>Conclusión:</b> {esc(d.get('balance'))}"   # sin comunicado con el que comparar
+    return blocks + call
+
+
+HELP_TEXT = ("🎙️ <b>Análisis de calls</b>\n"
+             "Envíame la transcripción como <b>archivo</b> (PDF, TXT o Word), por ejemplo descargada de TIKR, "
+             "y te devuelvo el análisis en unos minutos.\n"
+             "Opcional: escribe el ticker o una indicación en el texto del archivo (p. ej. <i>NOVO 3T26</i>).")
+
+
+def run_inbox(conn, dry_run=False):
+    """Lee los mensajes nuevos del bot y analiza los documentos enviados desde tu chat."""
+    row = conn.execute("SELECT value FROM meta WHERE key='tg_offset'").fetchone()
+    offset = int(row[0]) if row else 0
+    updates = telegram_api("getUpdates", offset=offset, timeout=0, allowed_updates='["message"]')
+    if not updates:
+        return
+    for upd in updates:
+        conn.execute("REPLACE INTO meta VALUES ('tg_offset', ?, ?)",
+                     (str(upd["update_id"] + 1), datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        msg = upd.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+            log(f"Mensaje ignorado de otro chat: {msg.get('chat', {}).get('id')}")
+            continue
+        doc = msg.get("document")
+        if not doc:
+            if msg.get("text"):
+                send_telegram(HELP_TEXT, dry_run)
+            continue
+        name = doc.get("file_name") or "documento"
+        if not name.lower().endswith(DOC_EXTENSIONS):
+            send_telegram(f"⚠️ No sé leer <b>{esc(name)}</b>. Envíamelo en PDF, TXT o Word.", dry_run)
+            continue
+        if (doc.get("file_size") or 0) > MAX_DOC_BYTES:
+            send_telegram("⚠️ El archivo supera los 20 MB que permite Telegram a los bots.", dry_run)
+            continue
+        send_telegram(f"📥 Recibido <b>{esc(name)}</b>. Analizando la call…", dry_run)
+        try:
+            text = document_to_text(name, download_telegram_file(doc["file_id"]))
+            if len(text) < 2000:
+                raise ValueError("el documento tiene muy poco texto; si es un PDF escaneado, envíalo como TXT")
+            log(f"Analizando documento {name} ({len(text):,} caracteres)")
+            analysis = analyze_document(text, (msg.get("caption") or "").strip())
+            send_blocks("🎙️ <b>Análisis de la call</b>", document_blocks(analysis), dry_run)
+        except Exception as e:
+            log(f"Error con {name}: {e}")
+            send_telegram(f"⚠️ No he podido analizar <b>{esc(name)}</b>: {esc(str(e)[:300])}", dry_run)
+
+
 # ---------------------------------------------------------------- flujos principales
 def process(conn, company, filing):
     """Descarga y analiza un filing; guarda el resultado. Devuelve la fila o None."""
@@ -906,6 +1051,7 @@ def main():
     p.add_argument("--summary", action="store_true", help="envía el resumen de resultados pendientes")
     p.add_argument("--ticker", help="analiza el último resultado de una empresa y lo envía")
     p.add_argument("--call", help="analiza el último resultado de una empresa junto con su call")
+    p.add_argument("--inbox", action="store_true", help="analiza las transcripciones enviadas al bot por Telegram")
     p.add_argument("--test", action="store_true", help="mensaje de prueba a Telegram")
     p.add_argument("--dry-run", action="store_true", help="imprime en pantalla en lugar de enviar")
     args = p.parse_args()
@@ -913,6 +1059,11 @@ def main():
     if args.test:
         send_telegram("✅ <b>Earnings Alerts</b> funcionando. Te llegará el resumen de resultados del S&amp;P 500 cada mañana.",
                       args.dry_run)
+        return
+    if args.inbox:
+        if not ANTHROPIC_API_KEY:
+            sys.exit("Falta ANTHROPIC_API_KEY")
+        run_inbox(db_connect(), args.dry_run)
         return
     missing = [n for n, v in (("SEC_USER_AGENT", SEC_USER_AGENT), ("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)) if not v]
     if not args.summary and missing:
