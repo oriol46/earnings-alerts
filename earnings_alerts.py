@@ -1151,22 +1151,46 @@ def period_rank(k):
     return (int(m.group(2)), order[m.group(1)])
 
 
-def ir_document(url):
-    """Texto del documento de resultados: el PDF de la nota/carta si lo hay; si no, el texto de la página.
+PERIOD_WORDS = {"q1": r"first quarter|\bq1\b|three months|1st quarter",
+                "q2": r"second quarter|\bq2\b|first half|half[- ]year|\bh1\b|six months",
+                "q3": r"third quarter|\bq3\b|nine months|9 months|3rd quarter",
+                "q4": r"fourth quarter|\bq4\b|full[- ]year|annual|twelve months",
+                "h1": r"first half|\bh1\b|half[- ]year|six months|interim",
+                "h2": r"second half|\bh2\b|full[- ]year|annual",
+                "fy": r"full[- ]year|annual|fiscal year"}
+
+
+def mentions_period(text, tokens):
+    """El texto habla del periodo esperado (año + trimestre/semestre) en su parte principal."""
+    if not tokens:
+        return True
+    head = text[:15000]
+    return tokens[1] in head and bool(re.search(PERIOD_WORDS[tokens[0]], head, re.I))
+
+
+def ir_document(url, depth=0, tokens=None):
+    """Texto del documento de resultados de una publicación de la web de inversores.
+    Orden: nota de prensa enlazada > PDF del mismo periodo > texto de la página.
     Devuelve (texto, url_documento) o (None, None) si todavía no está publicado."""
     from urllib.parse import urljoin
     from bs4 import BeautifulSoup
+    tokens = tokens or _period_tokens(url)
     r = _web_get(url)
     if r.content[:4] == b"%PDF" or "pdf" in r.headers.get("content-type", ""):
-        return document_to_text("doc.pdf", r.content), url
+        text = document_to_text("doc.pdf", r.content)
+        return (text, url) if len(text) > 2000 and mentions_period(text, tokens) else (None, None)
     html = r.text.replace("\\u002F", "/").replace("\\/", "/")
-    cands = {}
-    for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
-        if re.search(r"\.pdf($|\?)|/download($|\?)|/api/asset/", a["href"], re.I):
-            cands.setdefault(urljoin(url, a["href"]), a.get_text(" ", strip=True))
+    soup = BeautifulSoup(html, "lxml")
+    press, docs = {}, {}
+    for a in soup.find_all("a", href=True):
+        href, label = urljoin(url, a["href"]), a.get_text(" ", strip=True)
+        if re.search(r"\.pdf($|\?)|/download($|\?)|/api/asset/", href, re.I):
+            docs.setdefault(href, label)
+        elif depth == 0 and (re.search(r"/publications/[a-z0-9-]{12,}|press-release", href, re.I)
+                             or re.fullmatch(r"press release", label, re.I)) and "?" not in href:
+            press.setdefault(href, label)
     for u in re.findall(r'["\'](https?://[^"\'\s]+\.pdf)', html, re.I):
-        cands.setdefault(u, "")
-    tokens = _period_tokens(url)
+        docs.setdefault(u, "")
 
     def rank(item):
         u, label = item
@@ -1174,20 +1198,33 @@ def ir_document(url):
         same_period = bool(tokens) and tokens[0] in flat and tokens[1] in flat
         doc_kind = re.search(r"press|release|communiqu|letter|update|results|revenue", u + " " + label, re.I)
         slides = re.search(r"presentation|slides", u + " " + label, re.I)
-        return (0 if same_period else 1, 0 if doc_kind else 1, 1 if slides else 0)
+        return (1 if slides else 0, 0 if same_period else 1, 0 if doc_kind else 1)
 
-    for doc_url, _label in sorted(cands.items(), key=rank)[:3]:
+    # 1. Nota de prensa enlazada (p. ej. LVMH: calendario -> /publications/continued-growth-in-the-third-quarter-...)
+    for href, label in sorted(press.items(), key=lambda i: 0 if re.search("press release", i[1], re.I) else 1)[:2]:
+        try:
+            text, doc_url = ir_document(href, depth=1, tokens=tokens)
+            if text:
+                return text, doc_url
+        except Exception as e:
+            log(f"  nota de prensa no legible {href}: {e}")
+    # 2. PDF del periodo (las presentaciones, al final: suelen ser imágenes con poco texto)
+    for doc_url, _label in sorted(docs.items(), key=rank)[:3]:
         try:
             d = _web_get(doc_url)
             if d.content[:4] != b"%PDF" and "pdf" not in d.headers.get("content-type", ""):
                 continue
             text = document_to_text("doc.pdf", d.content)
-            if len(text) > 2000:
+            if len(text) > 2000 and mentions_period(text, tokens):
                 return text, doc_url
         except Exception as e:
             log(f"  documento no legible {doc_url}: {e}")
-    text = html_to_text(html)
-    return (text, url) if len(text) > 6000 and RESULTS_RE.search(text) else (None, None)
+    # 3. Texto de la propia página, solo si habla del periodo correcto
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    text = html_to_text(str(main))
+    if len(text) > (3000 if depth else 6000) and RESULTS_RE.search(text) and mentions_period(text, tokens):
+        return text, url
+    return None, None
 
 
 def eu_candidates(conn, ticker):
