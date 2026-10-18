@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "check = revisar · summary = resumen · test = prueba · ticker = analizar una empresa"
+        description: "check = revisar · summary = resumen · test = prueba · ticker = analizar una empresa · call = empresa + call"
         default: "check"
       ticker:
-        description: "Ticker (solo para el modo ticker), p. ej. MSFT"
+        description: "Ticker (para los modos ticker y call), p. ej. MSFT"
         default: ""
 
 concurrency: earnings-alerts
@@ -24,6 +24,9 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+      # Empresas con aviso inmediato y análisis de la call (tickers del S&P 500, separados por comas)
+      WATCHLIST: "UBER,NFLX,META,MSFT,SPGI,V"
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +51,10 @@ jobs:
       - name: Analizar una empresa
         if: github.event.inputs.mode == 'ticker'
         run: python earnings_alerts.py --ticker "${{ github.event.inputs.ticker }}"
+
+      - name: Analizar una empresa con su call
+        if: github.event.inputs.mode == 'call'
+        run: python earnings_alerts.py --call "${{ github.event.inputs.ticker }}"
 
       - name: Revisar resultados nuevos
         if: github.event_name == 'schedule' || github.event.inputs.mode == 'check' || github.event.inputs.mode == 'summary'
