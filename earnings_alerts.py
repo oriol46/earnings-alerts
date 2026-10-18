@@ -1104,12 +1104,23 @@ def period_key(text):
     return f"fy-{m.group(1)}" if m else text
 
 
-def investegate_list(tidm):
-    """[(id, fecha, título, url)] de los anuncios RNS de una empresa de Londres."""
+def investegate_list(tidm, pages=1):
+    """[(id, fecha, título, url)] de los anuncios RNS de una empresa de Londres (más recientes primero)."""
     from bs4 import BeautifulSoup
-    soup = BeautifulSoup(_web_get(f"https://www.investegate.co.uk/company/{tidm}").text, "lxml")
     out = []
-    for a in soup.select("a.announcement-link"):
+    for page in range(1, pages + 1):
+        url = f"https://www.investegate.co.uk/company/{tidm}" + (f"?page={page}" if page > 1 else "")
+        soup = BeautifulSoup(_web_get(url).text, "lxml")
+        links = soup.select("a.announcement-link")
+        if not links:
+            break
+        out.extend(_investegate_rows(links))
+    return out
+
+
+def _investegate_rows(links):
+    out = []
+    for a in links:
         tds = a.find_parent("tr").find_all("td") if a.find_parent("tr") else []
         date = tds[0].get_text(strip=True) if tds else ""
         out.append((a["href"], date, a.get_text(" ", strip=True), a["href"]))
@@ -1327,7 +1338,7 @@ def run_eu_latest(conn, ticker, dry_run=False):
         sys.exit(f"No tengo fuente para {ticker}")
     eu_candidates(conn, ticker)            # guarda la línea base si es la primera vez
     if ticker.endswith(".L"):
-        items = [(i, t, u) for i, d, t, u in investegate_list(ticker[:-2])
+        items = [(i, t, u) for i, d, t, u in investegate_list(ticker[:-2], pages=6)
                  if RNS_RESULTS_RE.search(t) and not RNS_NOT_RESULTS_RE.search(t)]
     else:
         items = sorted(((period_key(u), u, u) for u in ir_links(EU_SOURCES[ticker])),
