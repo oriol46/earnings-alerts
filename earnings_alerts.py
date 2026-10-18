@@ -233,16 +233,20 @@ Registra tu análisis llamando a la herramienta "registrar_resultado". Si no pue
   "ingresos": "cifra con unidad, p. ej. '94,9 mil M$'",
   "crec_ingresos": "variación interanual, p. ej. '+8%', o null",
   "bpa": "BPA ajustado si existe, con '(GAAP)' si solo hay GAAP, p. ej. '1,85 $'",
-  "vs_consenso": "bate" | "en linea" | "decepciona" | null,
+  "vs_consenso": "bate" | "en linea" | "decepciona" | "sin consenso",
   "guidance": "sube" | "mantiene" | "baja" | "inicia" | "retira" | "no da",
   "guidance_detalle": "una frase con las cifras, o null",
-  "destacados": ["máximo 3 puntos concretos con cifras: márgenes, segmentos, KPIs clave"],
-  "alertas": ["solo hechos excepcionales: recorte o fuerte subida del dividendo, recompra relevante, cambio de CEO/CFO, deterioros, reformulación de cuentas, adquisición, reestructuración. Lista vacía si no hay"],
+  "destacados": ["exactamente 3 puntos, máximo 20 palabras cada uno, con cifras: segmentos, márgenes, KPIs clave del sector"],
+  "alertas": ["normalmente lista VACÍA; ver reglas"],
   "tono": "positivo" | "neutro" | "negativo",
-  "resumen": "una frase de máximo 25 palabras con la lectura del trimestre"
+  "resumen": "una frase de máximo 20 palabras con la LECTURA del trimestre (qué lo explica y qué implica), sin repetir las cifras de ingresos ni BPA"
 }}
 
-Reglas: escribe en español con formato numérico español; usa solo datos del documento (y el consenso indicado); no inventes; si un dato no aparece, pon null. "vs_consenso" solo si se te ha dado el consenso (compáralo con el BPA ajustado). "tono" refleja la calidad del trimestre y del guidance, no el lenguaje de la empresa.
+Reglas:
+- Español con formato numérico español. Usa solo datos del documento (y el consenso indicado); no inventes; si un dato no aparece, null.
+- "vs_consenso": compara el BPA ajustado con el consenso indicado ("en linea" si la diferencia es menor del 2%); "sin consenso" si no se te ha dado.
+- "tono" refleja la calidad del trimestre y del guidance, no el lenguaje de la empresa.
+- "alertas" es SOLO para hechos excepcionales que un gestor deba conocer aunque no siga la empresa: recorte o suspensión del dividendo, subida del dividendo superior al 20%, programa de recompra NUEVO de más del 5% de la capitalización, salida o cambio de CEO/CFO, deterioros o provisiones extraordinarias, reformulación de cuentas, adquisición o desinversión relevante anunciada, reestructuración con despidos, investigación regulatoria o litigio material. NO son alertas: recompras o dividendos ordinarios, provisiones habituales del negocio, caídas de un segmento, variaciones normales de márgenes. Máximo 2. En la gran mayoría de trimestres la lista debe estar vacía.
 
 DOCUMENTO:
 {doc}"""
@@ -271,7 +275,8 @@ ANALYSIS_TOOL = {
             "guidance": {"type": "string", "enum": ["sube", "mantiene", "baja", "inicia", "retira", "no da"]},
             "guidance_detalle": _nullable("string"),
             "destacados": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-            "alertas": {"type": "array", "items": {"type": "string"}},
+            "alertas": {"type": "array", "items": {"type": "string"}, "maxItems": 2,
+                        "description": "Solo hechos excepcionales según las reglas; normalmente vacía."},
             "tono": {"type": "string", "enum": ["positivo", "neutro", "negativo"]},
             "resumen": {"type": "string"},
         },
@@ -359,38 +364,72 @@ def esc(value):
     return html.escape(str(value)) if value not in (None, "") else ""
 
 
-def company_line(row):
-    a = row["analysis"]
-    ventas = esc(a.get("ingresos"))
+VS_TXT = {"bate": "✅ bate", "en linea": "➖ en línea", "decepciona": "❌ decepciona"}
+GUIDE_TXT = {"sube": "⬆️ sube", "mantiene": "➡️ mantiene", "baja": "⬇️ baja",
+             "inicia": "🆕 inicia", "retira": "⛔ retira", "no da": "— no da"}
+
+
+def _money(x):
+    return f"{x:.2f} $".replace(".", ",")
+
+
+def _revenue(a):
+    rev = esc(a.get("ingresos")) or "—"
     if a.get("crec_ingresos"):
-        ventas += f" ({esc(a['crec_ingresos'])})"
-    bits = []
-    if ventas:
-        bits.append(f"Ventas {ventas}")
-    if a.get("bpa"):
-        bits.append(f"BPA {esc(a['bpa'])}{VS.get(a.get('vs_consenso'), '')}")
-    if a.get("guidance") in GUIDE:
-        bits.append(GUIDE[a["guidance"]])
-    lines = [f"{TONE.get(a.get('tono'), '⚪')} <a href=\"{esc(row['url'])}\"><b>{esc(row['ticker'])}</b></a> "
-             f"{esc(row['name'])} · {esc(a.get('periodo'))}"]
-    if bits:
-        lines.append("   " + " · ".join(bits))
+        rev += f" ({esc(a['crec_ingresos'])} a/a)"
+    return rev
+
+
+def _eps(a, with_consensus=True):
+    eps = esc(a.get("bpa")) or "—"
+    if with_consensus and a.get("consenso_bpa") is not None:
+        eps += f" vs {_money(a['consenso_bpa'])} est."
+    if a.get("vs_consenso") in VS:
+        eps += VS[a["vs_consenso"]]
+    return eps
+
+
+def company_line(row):
+    """Bloque compacto para el resumen diario."""
+    a = row["analysis"]
+    lines = [f"{TONE.get(a.get('tono'), '⚪')} <a href=\"{esc(row['url'])}\"><b>{esc(row['ticker'])}</b></a>"
+             f" · {esc(row['name'])} · {esc(a.get('periodo'))}",
+             f"Ingresos {_revenue(a)}",
+             f"BPA {_eps(a)} · Guía {GUIDE.get(a.get('guidance'), '—').replace('Guía ', '')}"]
     if a.get("resumen"):
-        lines.append(f"   <i>{esc(a['resumen'])}</i>")
+        lines.append(f"↳ <i>{esc(a['resumen'])}</i>")
     for alert in a.get("alertas") or []:
-        lines.append(f"   ⚠️ {esc(alert)}")
+        lines.append(f"⚠️ {esc(alert)}")
     return "\n".join(lines)
 
 
 def company_detail(row):
+    """Mensaje completo de una empresa, por bloques."""
     a = row["analysis"]
-    out = [company_line(row)]
+    date = row.get("filing_date") or ""
+    if date:
+        date = f" · publicado {date[8:10]}/{date[5:7]}"
+    out = [f"{TONE.get(a.get('tono'), '⚪')} <b>{esc(row['ticker'])} · {esc(row['name'])}</b>",
+           f"{esc(row.get('sector', ''))} · {esc(a.get('periodo'))}{date}"]
+
+    figures = [f"Ingresos: {_revenue(a)}", f"BPA: {esc(a.get('bpa')) or '—'}"]
     if a.get("consenso_bpa") is not None:
-        out.append(f"\nConsenso BPA: {a['consenso_bpa']:.2f} $".replace(".", ","))
+        verdict = VS_TXT.get(a.get("vs_consenso"))
+        figures.append(f"Consenso BPA: {_money(a['consenso_bpa'])}" + (f" → {verdict}" if verdict else ""))
+    guide = GUIDE_TXT.get(a.get("guidance"), "—")
     if a.get("guidance_detalle"):
-        out.append(f"\n<b>Guidance:</b> {esc(a['guidance_detalle'])}")
+        guide += f" · {esc(a['guidance_detalle'])}"
+    figures.append(f"Guidance: {guide}")
+    out.append("\n📊 <b>Cifras</b>\n" + "\n".join(figures))
+
+    if a.get("resumen"):
+        out.append(f"\n💬 <b>Lectura</b>\n<i>{esc(a['resumen'])}</i>")
     if a.get("destacados"):
-        out.append("\n<b>Destacados</b>\n" + "\n".join(f"• {esc(d)}" for d in a["destacados"]))
+        out.append("\n🔎 <b>Destacados</b>\n" + "\n".join(f"• {esc(d)}" for d in a["destacados"]))
+    if a.get("alertas"):
+        out.append("\n⚠️ <b>Alertas</b>\n" + "\n".join(f"• {esc(x)}" for x in a["alertas"]))
+    if row.get("url"):
+        out.append(f"\n🔗 <a href=\"{esc(row['url'])}\">Comunicado en la SEC</a>")
     return "\n".join(out)
 
 
@@ -415,7 +454,8 @@ def process(conn, company, filing):
                         input_tokens=?, output_tokens=? WHERE accession=?""",
                      (url, json.dumps(analysis, ensure_ascii=False), tin, tout, acc))
         conn.commit()
-        return {**company, "url": url, "analysis": analysis, "tin": tin, "tout": tout}
+        return {**company, "filing_date": filing["filing_date"], "url": url, "analysis": analysis,
+                "tin": tin, "tout": tout}
     except Exception as e:
         global LAST_ERROR
         LAST_ERROR = str(e)[:300]
