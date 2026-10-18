@@ -1,0 +1,65 @@
+name: earnings-alerts
+
+on:
+  schedule:
+    - cron: "*/30 10-23 * * 1-5"   # revisa resultados nuevos cada 30 min (horario de EE. UU., en UTC)
+    - cron: "37 6 * * 2-6"         # resumen diario de martes a sábado (8:37 en verano, 7:37 en invierno)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check = revisar · summary = resumen · test = prueba · ticker = analizar una empresa"
+        default: "check"
+      ticker:
+        description: "Ticker (solo para el modo ticker), p. ej. MSFT"
+        default: ""
+
+concurrency: earnings-alerts
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Recupera la base de datos de la ejecución anterior
+      - uses: actions/cache/restore@v4
+        with:
+          path: earnings.db
+          key: earnings-db-${{ github.run_id }}
+          restore-keys: earnings-db-
+
+      - name: Mensaje de prueba
+        if: github.event.inputs.mode == 'test'
+        run: python earnings_alerts.py --test
+
+      - name: Analizar una empresa
+        if: github.event.inputs.mode == 'ticker'
+        run: python earnings_alerts.py --ticker "${{ github.event.inputs.ticker }}"
+
+      - name: Revisar resultados nuevos
+        if: github.event_name == 'schedule' || github.event.inputs.mode == 'check' || github.event.inputs.mode == 'summary'
+        run: python earnings_alerts.py
+
+      - name: Resumen diario
+        if: github.event.schedule == '37 6 * * 2-6' || github.event.inputs.mode == 'summary'
+        run: python earnings_alerts.py --summary
+
+      # Guarda la base de datos para la siguiente ejecución
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: earnings.db
+          key: earnings-db-${{ github.run_id }}
