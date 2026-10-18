@@ -227,7 +227,7 @@ def eps_consensus(ticker, filing_date):
 ANALYSIS_PROMPT = """Eres un analista de renta variable. Analiza el comunicado de resultados de {name} ({ticker}, sector {sector}), presentado a la SEC el {date}.
 {consensus_line}
 
-Devuelve SOLO un JSON válido, sin texto antes ni después, con esta estructura:
+Registra tu análisis llamando a la herramienta "registrar_resultado". Si no puedes usarla, devuelve SOLO un JSON válido con esta estructura:
 {{
   "periodo": "trimestre y año fiscal, p. ej. '3T FY2026'",
   "ingresos": "cifra con unidad, p. ej. '94,9 mil M$'",
@@ -256,22 +256,60 @@ Escribe la "lectura del día" en español: entre 3 y 5 viñetas breves (máximo 
 _client = None
 
 
-def claude(prompt, model, max_tokens):
+_nullable = lambda t: {"type": [t, "null"]}
+ANALYSIS_TOOL = {
+    "name": "registrar_resultado",
+    "description": "Registra el análisis estructurado del comunicado de resultados.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "periodo": _nullable("string"),
+            "ingresos": _nullable("string"),
+            "crec_ingresos": _nullable("string"),
+            "bpa": _nullable("string"),
+            "vs_consenso": {"type": "string", "enum": ["bate", "en linea", "decepciona", "sin consenso"]},
+            "guidance": {"type": "string", "enum": ["sube", "mantiene", "baja", "inicia", "retira", "no da"]},
+            "guidance_detalle": _nullable("string"),
+            "destacados": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+            "alertas": {"type": "array", "items": {"type": "string"}},
+            "tono": {"type": "string", "enum": ["positivo", "neutro", "negativo"]},
+            "resumen": {"type": "string"},
+        },
+        "required": ["periodo", "ingresos", "bpa", "guidance", "destacados", "alertas", "tono", "resumen"],
+    },
+}
+
+
+def claude_message(prompt, model, max_tokens, tools=None):
     global _client
     if _client is None:
         import anthropic
         _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = _client.messages.create(model=model, max_tokens=max_tokens,
-                                  messages=[{"role": "user", "content": prompt}])
+    kwargs = {"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}
+    if tools:
+        kwargs["tools"] = tools
+    return _client.messages.create(**kwargs)
+
+
+def claude(prompt, model, max_tokens):
+    msg = claude_message(prompt, model, max_tokens)
     text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     return text, msg.usage.input_tokens, msg.usage.output_tokens
 
 
-def parse_json(text):
+def extract_analysis(msg):
+    """Saca el análisis de la respuesta: primero de la herramienta, si no, de un JSON en el texto."""
+    for block in msg.content:
+        if getattr(block, "type", "") == "tool_use" and block.name == ANALYSIS_TOOL["name"]:
+            return dict(block.input)
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    text = re.sub(r"```(?:json)?", "", text)
     start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < 0:
-        raise ValueError("Claude no devolvió JSON")
-    return json.loads(text[start:end + 1])
+    if start >= 0 and end > start:
+        return json.loads(text[start:end + 1])
+    kinds = ", ".join(getattr(b, "type", "?") for b in msg.content) or "vacía"
+    raise ValueError(f"Claude no devolvió el análisis (stop_reason={msg.stop_reason}; bloques: {kinds}; "
+                     f"texto: {text[:200]!r})")
 
 
 def analyze(company, filing, doc):
@@ -280,10 +318,10 @@ def analyze(company, filing, doc):
                       if consensus is not None else "No hay dato de consenso disponible.")
     prompt = ANALYSIS_PROMPT.format(name=company["name"], ticker=company["ticker"], sector=company["sector"],
                                     date=filing["filing_date"], consensus_line=consensus_line, doc=doc)
-    text, tin, tout = claude(prompt, MODEL_FAST, 1500)
-    data = parse_json(text)
+    msg = claude_message(prompt, MODEL_FAST, 4000, tools=[ANALYSIS_TOOL])
+    data = extract_analysis(msg)
     data["consenso_bpa"] = consensus
-    return data, tin, tout
+    return data, msg.usage.input_tokens, msg.usage.output_tokens
 
 
 # ---------------------------------------------------------------- Telegram
@@ -379,17 +417,22 @@ def process(conn, company, filing):
         conn.commit()
         return {**company, "url": url, "analysis": analysis, "tin": tin, "tout": tout}
     except Exception as e:
+        global LAST_ERROR
+        LAST_ERROR = str(e)[:300]
         log(f"  error con {company['ticker']}: {e}")
         conn.execute("UPDATE filings SET status='error', attempts=attempts+1 WHERE accession=?", (acc,))
         conn.commit()
         return None
 
 
+LAST_ERROR = ""
+
+
 def run_check(conn):
     companies = load_sp500(conn)
     since = (datetime.now(timezone.utc).date() - timedelta(days=LOOKBACK_DAYS)).isoformat()
     log(f"Revisando {len(companies)} empresas (8-K item 2.02 desde {since})")
-    done, tin, tout = 0, 0, 0
+    done, tin, tout, errors = 0, 0, 0, []
     for company in companies:
         try:
             filings = earnings_filings(company, since)
@@ -397,10 +440,20 @@ def run_check(conn):
             log(f"  {company['ticker']}: {e}")
             continue
         for filing in filings:
+            before = conn.execute("SELECT status, attempts FROM filings WHERE accession=?",
+                                  (filing["accession"],)).fetchone()
+            if before and (before[0] == "ok" or before[1] >= MAX_ATTEMPTS):
+                continue
             result = process(conn, company, filing)
             if result:
                 done, tin, tout = done + 1, tin + result["tin"], tout + result["tout"]
+            else:
+                errors.append(f"{company['ticker']}: {LAST_ERROR}")
     log(f"Hecho: {done} resultados analizados · tokens entrada {tin:,} · salida {tout:,}")
+    if errors:
+        lines = "\n".join(f"• {esc(e[:150])}" for e in errors[:10])
+        more = f"\n… y {len(errors) - 10} más" if len(errors) > 10 else ""
+        send_telegram(f"⚠️ <b>Earnings Alerts</b>: {len(errors)} análisis fallidos (se reintentan solos)\n{lines}{more}")
 
 
 def run_summary(conn, dry_run=False):
@@ -459,6 +512,8 @@ def run_ticker(conn, ticker, dry_run=False):
     result = process(conn, company, filing)
     if result:
         send_telegram(company_detail(result), dry_run)
+    else:
+        send_telegram(f"⚠️ No se pudo analizar <b>{esc(ticker)}</b>: {esc(LAST_ERROR)}", dry_run)
 
 
 def main():
