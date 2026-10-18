@@ -2,7 +2,7 @@ name: earnings-alerts
 
 on:
   schedule:
-    - cron: "*/30 10-23 * * 1-5"   # revisa resultados nuevos cada 30 min (horario de EE. UU., en UTC)
+    - cron: "*/30 10-23 * * 1-5"   # cada 30 min, 10:00-23:30 UTC = 6:00-19:30 Nueva York (pre-market y after-hours)
     - cron: "37 6 * * 2-6"         # resumen diario de martes a sábado (8:37 en verano, 7:37 en invierno)
   workflow_dispatch:
     inputs:
@@ -25,8 +25,6 @@ jobs:
       SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-      # Empresas con aviso inmediato y análisis de la call (tickers del S&P 500, separados por comas)
-      WATCHLIST: "NVDA,AAPL,MSFT,GOOGL,AMZN,META,AVGO,TSLA,MU,LLY,CRWD,JPM,AMD,ORCL,V,JNJ,WMT,KO,MA,COST,BKNG,PLTR,INTC,SPCX,TSM,NFLX,UBER,SPGI,ADBE,NKE,ISRG,CRM,ABNB,SPOT"
     steps:
       - uses: actions/checkout@v4
 
