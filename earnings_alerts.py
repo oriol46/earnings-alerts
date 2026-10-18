@@ -414,7 +414,11 @@ ANÁLISIS DEL COMUNICADO:
 
 Analiza la call y registra el resultado con la herramienta "registrar_call". Céntrate en lo que la call AÑADE al comunicado: matices de la directiva, explicaciones, cambios de mensaje y el turno de preguntas. Escribe en español, concreto y con cifras cuando las haya. No inventes nada que no esté en la transcripción.
 
-Prioriza la exhaustividad sobre la brevedad: es preferible un punto de más que dejarse algo relevante para un inversor (cambios en guidance o en el mensaje, KPIs, capital, márgenes, demanda, competencia, regulación, M&A, riesgos).
+Cobertura y concisión:
+- No omitas ningún TEMA relevante para un inversor (cambios en guidance o en el mensaje, KPIs, capital, márgenes, demanda, competencia, regulación, M&A, riesgos).
+- Pero cada punto en 1-2 frases densas, con solo las 2-3 cifras que de verdad importan. Nada de contexto narrativo, citas largas ni enumerar todas las cifras.
+- No repitas información entre secciones: lo que vaya en "guidance_call" no va en "mensajes_clave", y "balance" no repite lo anterior.
+- El mensaje se lee en el móvil: la sección completa de la call debe ocupar unas 300-450 palabras en total.
 
 Cuando cites a alguien, usa siempre nombre, apellido y cargo, por ejemplo "Ted Pick (CEO)" o "Sharon Yeshaya (CFO)"; para analistas, nombre y banco. Nunca solo el nombre de pila.
 
@@ -431,26 +435,26 @@ CALL_TOOL = {
         "properties": {
             "corresponde": {"type": "boolean", "description": "La transcripción es del trimestre indicado"},
             "tono": {"type": "string", "enum": ["confiado", "neutral", "prudente", "defensivo"]},
-            "tono_explicacion": {"type": "string", "description": "1-2 frases"},
+            "tono_explicacion": {"type": "string", "description": "Una frase, máximo 30 palabras"},
             "mensajes_clave": {"type": "array", "items": {"type": "string"}, "maxItems": 6,
-                               "description": "Todo lo relevante que no estaba en el comunicado (normalmente 3-6 puntos)"},
+                               "description": "Un punto por tema relevante que no estaba en el comunicado (normalmente 4-6); cada uno 1-2 frases, máximo 45 palabras"},
             "guidance_call": {"type": ["string", "null"],
-                              "description": "Matices sobre el guidance dados en la call, con cifras, o null"},
-            "preguntas": {"type": "array", "maxItems": 6, "items": {
+                              "description": "Matices sobre el guidance dados en la call, máximo 40 palabras, o null"},
+            "preguntas": {"type": "array", "maxItems": 5, "items": {
                 "type": "object",
-                "properties": {"tema": {"type": "string"},
+                "properties": {"tema": {"type": "string", "description": "Tema en pocas palabras y analista, p. ej. 'Capex de IA (Mike Mayo, Wells Fargo)'"},
                                "respuesta": {"type": "string", "enum": ["clara", "vaga", "evasiva"]},
                                "detalle": {"type": "string",
-                                           "description": "Qué respondió y quién (nombre y cargo), 1-2 frases"}},
+                                           "description": "Quién respondió y qué dijo, máximo 35 palabras"}},
                 "required": ["tema", "respuesta", "detalle"]},
-                "description": "Las preguntas de analistas relevantes (normalmente 3-6) y cómo respondió la directiva"},
-            "riesgos": {"type": "array", "items": {"type": "string"}, "maxItems": 4,
-                        "description": "Riesgos o señales de alerta mencionados; vacío si no hay"},
+                "description": "Las preguntas de analistas más relevantes (normalmente 3-5) y cómo respondió la directiva"},
+            "riesgos": {"type": "array", "items": {"type": "string"}, "maxItems": 3,
+                        "description": "Riesgos o señales de alerta mencionados, máximo 25 palabras cada uno; vacío si no hay"},
             "impacto": {"type": "string", "enum": ["mejora", "confirma", "empeora"],
                         "description": "Si la call mejora, confirma o empeora la lectura del comunicado"},
             "balance": {"type": "string",
-                        "description": "1-2 frases con el matiz principal que aporta la call. No empieces repitiendo "
-                                       "'confirma/mejora/empeora' ni 'la call', ve directo al contenido"},
+                        "description": "Una frase, máximo 35 palabras, con el matiz principal que aporta la call. No empieces "
+                                       "repitiendo 'confirma/mejora/empeora' ni 'la call', ve directo al contenido"},
         },
         "required": ["corresponde", "tono", "tono_explicacion", "mensajes_clave", "preguntas", "riesgos",
                      "impacto", "balance"],
