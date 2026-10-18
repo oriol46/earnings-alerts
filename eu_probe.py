@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Prueba temporal: comprueba qué devuelven las fuentes europeas de resultados.
+"""Prueba temporal (2ª ronda): estructura interna de Investegate, Euronext, LVMH y Adyen.
 Se lanza a mano desde GitHub (tarea eu-probe) y el registro se copia para analizarlo. Se puede borrar después."""
-import json
 import os
 import re
 
@@ -9,78 +8,86 @@ import requests
 from bs4 import BeautifulSoup
 
 UA = os.environ.get("SEC_USER_AGENT") or "earnings-alerts probe"
-BROWSER = {"User-Agent": f"Mozilla/5.0 (compatible; earnings-alerts; {UA})",
-           "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
-           "Accept-Language": "en-GB,en;q=0.9"}
+H = {"User-Agent": f"Mozilla/5.0 (compatible; earnings-alerts; {UA})",
+     "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
+     "Accept-Language": "en-GB,en;q=0.9"}
 
 
-def show(title, r, n=1200):
-    print(f"\n===== {title} =====")
-    if isinstance(r, Exception):
-        print(f"ERROR: {r}")
-        return None
-    print(f"HTTP {r.status_code} · {r.headers.get('content-type', '?')} · {len(r.content):,} bytes · {r.url}")
-    print(r.text[:n].replace("\n\n", "\n"))
-    return r
-
-
-def get(url, **kw):
+def get(url):
     try:
-        return requests.get(url, headers=BROWSER, timeout=30, **kw)
+        r = requests.get(url, headers=H, timeout=30)
+        print(f"\n===== {url}\nHTTP {r.status_code} · {r.headers.get('content-type', '?')} · {len(r.content):,} bytes")
+        return r
     except Exception as e:
-        return e
+        print(f"\n===== {url}\nERROR {e}")
+        return None
 
 
-def links(r, pattern, limit=12):
-    if isinstance(r, Exception) or r.status_code != 200:
-        return
+def snippet(text, pattern, width=700, limit=2):
+    for i, m in enumerate(re.finditer(pattern, text, re.I)):
+        if i >= limit:
+            break
+        s = max(0, m.start() - 200)
+        print(f"--- contexto de /{pattern}/ en {m.start()}:\n" + re.sub(r"\s+", " ", text[s:s + width]))
+
+
+# 1. Investegate: estructura de una fila del listado y de un anuncio
+r = get("https://www.investegate.co.uk/company/LSEG")
+if r is not None and r.ok:
     soup = BeautifulSoup(r.text, "lxml")
-    found = 0
+    a = soup.find("a", href=re.compile(r"/announcement/rns/"))
+    if a:
+        row = a.find_parent("tr") or a.find_parent("div")
+        print("FILA:", re.sub(r"\s+", " ", str(row))[:900])
+        ann = a["href"]
+        r2 = get(ann if ann.startswith("http") else "https://www.investegate.co.uk" + ann)
+        if r2 is not None and r2.ok:
+            s2 = BeautifulSoup(r2.text, "lxml")
+            for tag in s2.find_all(["div", "article", "section"], class_=True):
+                txt = tag.get_text(" ", strip=True)
+                if len(txt) > 400:
+                    print(f"  bloque <{tag.name} class='{' '.join(tag['class'])}'> {len(txt)} car.: {txt[:160]}")
+            snippet(r2.text, r"Released|Date|RNS Number", 400, 2)
+    print("filas con 'Results':", len(re.findall(r"Results|Trading Update|Interim", r.text)))
+r = get("https://www.investegate.co.uk/company/LSEG?page=2")
+
+# 2. Euronext: ¿de dónde carga la lista de notas de prensa?
+r = get("https://live.euronext.com/en/listview/company-press-release/FR0000121014-XPAR")
+if r is not None and r.ok:
+    t = r.text
+    print("filas <tr>:", t.count("<tr"), "· 'views-row':", t.count("views-row"), "· 'LVMH':", t.count("LVMH"))
+    for u in sorted(set(re.findall(r'["\'](/[a-z]{2}/ajax/[^"\']+|/[^"\']*views/ajax[^"\']*|/[^"\']*listview[^"\']*)["\']', t)))[:25]:
+        print("  url:", u)
+    snippet(t, r"view_name|view_display_id|ajaxViews", 600, 3)
+    snippet(t, r"<table", 900, 2)
+for u in ("https://live.euronext.com/en/products/equities/company-news?search_api_fulltext=LVMH",
+          "https://live.euronext.com/en/ajax/getCompanyPressRelease/FR0000121014-XPAR",
+          "https://live.euronext.com/en/listview/company-press-release/FR0000121014-XPAR?page=0&_wrapper_format=drupal_ajax"):
+    r = get(u)
+    if r is not None and r.ok:
+        print("'LVMH':", r.text.count("LVMH"), "· <tr:", r.text.count("<tr"))
+        snippet(r.text, r"LVMH", 600, 2)
+
+# 3. LVMH: publicaciones (web Next.js, puede llevar los datos en __NEXT_DATA__)
+r = get("https://www.lvmh.com/en/publications?tag=Press%20releases")
+if r is not None and r.ok:
+    print("__NEXT_DATA__:", "__NEXT_DATA__" in r.text, "· 'revenue':", len(re.findall("revenue", r.text, re.I)),
+          "· pdfs:", len(re.findall(r"\.pdf", r.text)))
+    for u in sorted(set(re.findall(r'https://[^"\']+\.pdf', r.text)))[:10]:
+        print("  pdf:", u)
+    snippet(r.text, r"Q3 2026|third quarter|nine months|revenue for", 600, 3)
+r = get("https://www.lvmh.com/en/financial-calendar/2026-q3-revenue")
+if r is not None and r.ok:
+    for u in sorted(set(re.findall(r'https://[^"\']+\.pdf', r.text)))[:10]:
+        print("  pdf:", u)
+
+# 4. Adyen: página de resultados
+r = get("https://investors.adyen.com/financials")
+if r is not None and r.ok:
+    soup = BeautifulSoup(r.text, "lxml")
     for a in soup.find_all("a", href=True):
-        text = a.get_text(" ", strip=True)
-        if re.search(pattern, a["href"] + " " + text, re.I) and text:
-            print(f"  · {text[:110]} -> {a['href'][:160]}")
-            found += 1
-            if found >= limit:
-                break
-    print(f"  ({found} enlaces que encajan con /{pattern}/)")
+        if re.search(r"financials/|\.pdf|letter|update", a["href"], re.I):
+            print("  ·", a.get_text(" ", strip=True)[:90], "->", a["href"][:140])
+    snippet(r.text, r"Q3 2026|business update", 500, 2)
 
-
-# 1. Euronext: RSS general de notas de prensa de empresas
-r = show("Euronext RSS", get("https://live.euronext.com/rss/company-pr-release"), 1500)
-if not isinstance(r, Exception):
-    print("items:", r.text.count("<item>"), "· LVMH:", r.text.count("LVMH"), "· Adyen:", r.text.count("ADYEN") + r.text.count("Adyen"))
-
-# 2. Euronext: listado de notas de prensa por emisor (ISIN-mercado)
-for name, code in (("LVMH", "FR0000121014-XPAR"), ("Adyen", "NL0012969182-XAMS")):
-    r = show(f"Euronext listado {name}", get(f"https://live.euronext.com/en/listview/company-press-release/{code}"), 600)
-    links(r, r"press-release|company-news|/node/|results|sales|revenue")
-    r = show(f"Euronext ficha {name}", get(f"https://live.euronext.com/en/product/equities/{code}/company-information"), 300)
-    links(r, r"press|news|release")
-
-# 3. Londres: FCA National Storage Mechanism (API de búsqueda)
-body = {"from": 0, "size": 5, "sort": "submitted_date", "sortorder": "desc",
-        "criteriaObj": {"criteria": [], "dateCriteria": []}}   # últimas publicaciones, para ver qué campos devuelve
-try:
-    r = requests.post("https://api.data.fca.org.uk/search?index=fca-nsm-searchdata", json=body,
-                      headers={**BROWSER, "Content-Type": "application/json"}, timeout=30)
-except Exception as e:
-    r = e
-show("FCA NSM API (últimas publicaciones)", r, 1500)
-
-# 4. Londres: Investegate (agregador de RNS)
-r = show("Investegate LSEG", get("https://www.investegate.co.uk/company/LSEG"), 400)
-links(r, r"announcement|result|trading|interim|half")
-
-# 5. Londres: API de la web de la LSE
-show("LSE API instrumento", get("https://api.londonstockexchange.com/api/gw/lse/instruments/alldata/LSEG"), 800)
-
-# 6. Webs de inversores (alternativa)
-r = show("LVMH inversores", get("https://www.lvmh.com/en/investors"), 300)
-links(r, r"result|revenue|financial|press")
-r = show("Adyen inversores", get("https://investors.adyen.com/"), 300)
-links(r, r"result|financial|shareholder|letter|report")
-r = show("LSEG inversores", get("https://www.lseg.com/en/investor-relations"), 300)
-links(r, r"result|financial|report|rns|regulatory")
-
-print("\nFIN DE LA PRUEBA")
+print("\nFIN DE LA PRUEBA 2")
