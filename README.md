@@ -40,6 +40,7 @@ Es igual que el bot de insiders. Puedes reutilizar el **mismo bot y chat de Tele
 | `TELEGRAM_CHAT_ID` | el mismo chat_id |
 | `SEC_USER_AGENT` | el mismo que en el bot de insiders (nombre y email) |
 | `ANTHROPIC_API_KEY` | tu clave de la API de Claude (la de tu plataforma de inversión) |
+| `ALPHAVANTAGE_API_KEY` | clave gratuita de alphavantage.co (para las transcripciones de las calls) |
 
 ### Paso 5 — Probarlo
 1. Pestaña **Actions** → a la izquierda **earnings-alerts** → **Run workflow**.
@@ -50,6 +51,14 @@ Es igual que el bot de insiders. Puedes reutilizar el **mismo bot y chat de Tele
 A partir de ahí funciona solo.
 
 ---
+
+## Tu cartera: aviso inmediato + la call
+Las empresas de la línea `WATCHLIST` del archivo `.yml` (por defecto UBER, NFLX, META, MSFT, SPGI y V) tienen trato especial:
+1. **Al publicar resultados** te llega al momento el mensaje completo (📢 Resultados publicados).
+2. **Después de la call**, en cuanto Alpha Vantage publica la transcripción, te llega el mismo mensaje con la sección 🎙️ *La call*: tono de la directiva, mensajes clave, guidance, cómo respondieron a los analistas (🟢 clara · 🟡 vaga · 🔴 evasiva), riesgos y si la call mejora, confirma o empeora la lectura.
+
+Para añadir o quitar empresas, edita esa línea en GitHub (tickers del S&P 500 separados por comas).
+Para probarlo a mano: **Run workflow** con **mode** = `call` y **ticker** = el que quieras.
 
 ## Coste
 - GitHub Actions: gratis (repositorio público).

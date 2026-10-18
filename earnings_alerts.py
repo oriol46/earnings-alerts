@@ -31,6 +31,16 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
+
+# Empresas con aviso inmediato de resultados y análisis de la call (separadas por comas)
+WATCHLIST = {t.strip().upper() for t in os.environ.get("WATCHLIST", "UBER,NFLX,META,MSFT,SPGI,V").split(",")
+             if t.strip()}
+CALL_MIN_HOURS = 2          # espera mínima desde los resultados antes de buscar la transcripción
+CALL_RETRY_HOURS = 3        # cada cuánto se reintenta si aún no está publicada
+CALL_MAX_TRIES = 8          # intentos por empresa (~1 día de búsqueda en horario de mercado)
+AV_DAILY_LIMIT = int(os.environ.get("AV_DAILY_LIMIT", "20"))  # el plan gratis de Alpha Vantage es muy limitado
+MAX_TRANSCRIPT_CHARS = 120_000
 
 MODEL_FAST = os.environ.get("CLAUDE_MODEL_FAST", "claude-haiku-5-5")    # análisis de cada empresa
 MODEL_SMART = os.environ.get("CLAUDE_MODEL_SMART", "claude-sonnet-5-5")  # lectura del día
@@ -74,6 +84,11 @@ def db_connect():
         input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
         summarized INTEGER DEFAULT 0, created_at TEXT)""")
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT, updated TEXT)")
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(filings)")}
+    for column, kind in (("notified", "INTEGER DEFAULT 0"), ("call_status", "TEXT DEFAULT 'pending'"),
+                         ("call_tries", "INTEGER DEFAULT 0"), ("call_last_try", "TEXT"), ("call_analysis", "TEXT")):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE filings ADD COLUMN {column} {kind}")
     conn.commit()
     return conn
 
@@ -333,6 +348,121 @@ def analyze(company, filing, doc):
     return data, msg.usage.input_tokens, msg.usage.output_tokens
 
 
+# ---------------------------------------------------------------- conference call (Alpha Vantage)
+class AlphaVantageLimit(Exception):
+    pass
+
+
+def _av_budget_ok(conn):
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = conn.execute("SELECT value, updated FROM meta WHERE key='av_calls'").fetchone()
+    used = int(row[0]) if row and row[1] == today else 0
+    return used < AV_DAILY_LIMIT
+
+
+def _av_count(conn):
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = conn.execute("SELECT value, updated FROM meta WHERE key='av_calls'").fetchone()
+    used = int(row[0]) if row and row[1] == today else 0
+    conn.execute("REPLACE INTO meta VALUES ('av_calls', ?, ?)", (str(used + 1), today))
+    conn.commit()
+
+
+def quarter_candidates(periodo, filing_date):
+    """Trimestres a probar en Alpha Vantage: el fiscal que indica el comunicado y el natural anterior a la fecha."""
+    out = []
+    p = periodo or ""
+    q = re.search(r"([1-4])\s*T|Q\s*([1-4])|([1-4])Q", p, re.I)
+    y = re.search(r"(20\d\d)", p) or re.search(r"FY\s*'?(\d\d)\b", p, re.I)
+    if q and y:
+        year = y.group(1) if len(y.group(1)) == 4 else "20" + y.group(1)
+        out.append(f"{year}Q{next(g for g in q.groups() if g)}")
+    d = datetime.fromisoformat(filing_date).date()
+    cal_q, cal_y = (d.month - 1) // 3, d.year     # trimestre natural anterior a la publicación
+    if cal_q == 0:
+        cal_q, cal_y = 4, cal_y - 1
+    if f"{cal_y}Q{cal_q}" not in out:
+        out.append(f"{cal_y}Q{cal_q}")
+    return out
+
+
+def fetch_transcript(conn, ticker, quarter):
+    """Transcripción de la call desde Alpha Vantage. None si todavía no está."""
+    if not _av_budget_ok(conn):
+        raise AlphaVantageLimit("límite diario propio alcanzado")
+    r = SESSION.get("https://www.alphavantage.co/query",
+                    params={"function": "EARNINGS_CALL_TRANSCRIPT", "symbol": ticker.replace(".", "-"),
+                            "quarter": quarter, "apikey": ALPHAVANTAGE_API_KEY}, timeout=60)
+    _av_count(conn)
+    r.raise_for_status()
+    data = r.json()
+    if "Information" in data or "Note" in data:
+        raise AlphaVantageLimit(str(data.get("Information") or data.get("Note"))[:200])
+    if "Error Message" in data:
+        raise RuntimeError(data["Error Message"][:200])
+    turns = data.get("transcript") or []
+    if not turns:
+        return None
+    text = "\n\n".join(f"{t.get('speaker', '?')} ({t.get('title', '')}): {t.get('content', '')}" for t in turns)
+    return text[:MAX_TRANSCRIPT_CHARS]
+
+
+CALL_PROMPT = """Eres un gestor de renta variable fundamental. Tienes el análisis del comunicado de resultados de {name} ({ticker}) del trimestre {periodo}, publicado el {date}, y la transcripción de una conference call.
+
+ANÁLISIS DEL COMUNICADO:
+{analysis}
+
+Analiza la call y registra el resultado con la herramienta "registrar_call". Céntrate en lo que la call AÑADE al comunicado: matices de la directiva, explicaciones, cambios de mensaje y el turno de preguntas. Escribe en español, frases cortas y concretas con cifras cuando las haya. No inventes nada que no esté en la transcripción.
+
+Primero comprueba si la transcripción corresponde a ESE trimestre (por las cifras y las fechas que se mencionan). Si es de otro trimestre, marca "corresponde": false y rellena el resto con lo mínimo.
+
+TRANSCRIPCIÓN:
+{transcript}"""
+
+CALL_TOOL = {
+    "name": "registrar_call",
+    "description": "Registra el análisis de la conference call de resultados.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "corresponde": {"type": "boolean", "description": "La transcripción es del trimestre indicado"},
+            "tono": {"type": "string", "enum": ["confiado", "neutral", "prudente", "defensivo"]},
+            "tono_explicacion": {"type": "string", "description": "Máximo 25 palabras"},
+            "mensajes_clave": {"type": "array", "items": {"type": "string"}, "maxItems": 3,
+                               "description": "Lo nuevo que no estaba en el comunicado; máximo 25 palabras cada uno"},
+            "guidance_call": {"type": ["string", "null"],
+                              "description": "Matices sobre el guidance dados en la call, o null"},
+            "preguntas": {"type": "array", "maxItems": 3, "items": {
+                "type": "object",
+                "properties": {"tema": {"type": "string"},
+                               "respuesta": {"type": "string", "enum": ["clara", "vaga", "evasiva"]},
+                               "detalle": {"type": "string", "description": "Máximo 25 palabras"}},
+                "required": ["tema", "respuesta", "detalle"]},
+                "description": "Las preguntas de analistas más relevantes y cómo respondió la directiva"},
+            "riesgos": {"type": "array", "items": {"type": "string"}, "maxItems": 2,
+                        "description": "Riesgos o señales de alerta mencionados; vacío si no hay"},
+            "impacto": {"type": "string", "enum": ["mejora", "confirma", "empeora"],
+                        "description": "Si la call mejora, confirma o empeora la lectura del comunicado"},
+            "balance": {"type": "string", "description": "Una frase de máximo 25 palabras"},
+        },
+        "required": ["corresponde", "tono", "tono_explicacion", "mensajes_clave", "preguntas", "riesgos",
+                     "impacto", "balance"],
+    },
+}
+
+
+def analyze_call(row, transcript):
+    a = {k: v for k, v in row["analysis"].items() if k != "consenso_bpa"}
+    prompt = CALL_PROMPT.format(name=row["name"], ticker=row["ticker"], periodo=a.get("periodo"),
+                                date=row["filing_date"], analysis=json.dumps(a, ensure_ascii=False),
+                                transcript=transcript)
+    msg = claude_message(prompt, MODEL_SMART, 4000, tools=[CALL_TOOL])
+    for block in msg.content:
+        if getattr(block, "type", "") == "tool_use" and block.name == CALL_TOOL["name"]:
+            return dict(block.input)
+    raise ValueError(f"Claude no devolvió el análisis de la call (stop_reason={msg.stop_reason})")
+
+
 # ---------------------------------------------------------------- Telegram
 def send_telegram(text, dry_run=False):
     if dry_run:
@@ -464,6 +594,36 @@ def company_detail(row):
     return "\n".join(out)
 
 
+CALL_TONE = {"confiado": "💪 confiado", "neutral": "😐 neutral", "prudente": "🤔 prudente", "defensivo": "🛡️ defensivo"}
+ANSWER = {"clara": "🟢", "vaga": "🟡", "evasiva": "🔴"}
+IMPACT = {"mejora": "⬆️ Mejora", "confirma": "➡️ Confirma", "empeora": "⬇️ Empeora"}
+
+
+def call_section(c):
+    out = [f"🎙️ <b>La call</b> · tono {CALL_TONE.get(c.get('tono'), esc(c.get('tono')))}"]
+    if c.get("tono_explicacion"):
+        out.append(f"<i>{esc(c['tono_explicacion'])}</i>")
+    if c.get("mensajes_clave"):
+        out.append("\n<b>Mensajes clave</b>\n" + "\n".join(f"• {esc(m)}" for m in c["mensajes_clave"]))
+    if c.get("guidance_call"):
+        out.append(f"\n<b>Guidance en la call:</b> {esc(c['guidance_call'])}")
+    if c.get("preguntas"):
+        out.append("\n<b>Preguntas de analistas</b>\n" + "\n".join(
+            f"{ANSWER.get(p.get('respuesta'), '⚪')} <b>{esc(p.get('tema'))}</b>: {esc(p.get('detalle'))}"
+            for p in c["preguntas"]))
+    if c.get("riesgos"):
+        out.append("\n<b>Riesgos</b>\n" + "\n".join(f"• {esc(r)}" for r in c["riesgos"]))
+    out.append(f"\n📌 <b>{IMPACT.get(c.get('impacto'), 'Balance')}</b> la lectura del comunicado: "
+               f"{esc(c.get('balance'))}")
+    return "\n".join(out)
+
+
+def send_full_update(row, dry_run=False):
+    """Mensaje completo de resultados + sección de la call, sin partir bloques."""
+    header = "🎙️ <b>Actualización tras la call</b>"
+    send_blocks(header, [company_detail(row), call_section(row["call"])], dry_run)
+
+
 # ---------------------------------------------------------------- flujos principales
 def process(conn, company, filing):
     """Descarga y analiza un filing; guarda el resultado. Devuelve la fila o None."""
@@ -518,6 +678,10 @@ def run_check(conn):
             result = process(conn, company, filing)
             if result:
                 done, tin, tout = done + 1, tin + result["tin"], tout + result["tout"]
+                if company["ticker"].upper() in WATCHLIST:
+                    send_blocks("📢 <b>Resultados publicados</b>", [company_detail(result)])
+                    conn.execute("UPDATE filings SET notified=1 WHERE accession=?", (filing["accession"],))
+                    conn.commit()
             else:
                 errors.append(f"{company['ticker']}: {LAST_ERROR}")
     log(f"Hecho: {done} resultados analizados · tokens entrada {tin:,} · salida {tout:,}")
@@ -525,6 +689,77 @@ def run_check(conn):
         lines = "\n".join(f"• {esc(e[:150])}" for e in errors[:10])
         more = f"\n… y {len(errors) - 10} más" if len(errors) > 10 else ""
         send_telegram(f"⚠️ <b>Earnings Alerts</b>: {len(errors)} análisis fallidos (se reintentan solos)\n{lines}{more}")
+    if ALPHAVANTAGE_API_KEY:
+        run_calls(conn)
+
+
+def _load_row(conn, accession):
+    r = conn.execute("""SELECT accession, ticker, name, sector, filing_date, acceptance, url, analysis,
+                               call_tries FROM filings WHERE accession=?""", (accession,)).fetchone()
+    return {"accession": r[0], "ticker": r[1], "name": r[2], "sector": r[3], "filing_date": r[4],
+            "acceptance": r[5], "url": r[6], "analysis": json.loads(r[7]), "call_tries": r[8] or 0}
+
+
+def try_call(conn, row, dry_run=False):
+    """Busca la transcripción del trimestre, la analiza y envía el mensaje completo. True si lo consigue."""
+    for quarter in quarter_candidates(row["analysis"].get("periodo"), row["filing_date"]):
+        log(f"  {row['ticker']}: buscando transcripción {quarter}")
+        transcript = fetch_transcript(conn, row["ticker"], quarter)
+        if not transcript:
+            continue
+        call = analyze_call(row, transcript)
+        if not call.get("corresponde", True):
+            log(f"  {row['ticker']}: la transcripción {quarter} es de otro trimestre")
+            continue
+        conn.execute("UPDATE filings SET call_status='done', call_analysis=? WHERE accession=?",
+                     (json.dumps(call, ensure_ascii=False), row["accession"]))
+        conn.commit()
+        send_full_update({**row, "call": call}, dry_run)
+        return True
+    return False
+
+
+def run_calls(conn, dry_run=False):
+    """Para la watchlist: busca la transcripción de la call de los resultados recientes."""
+    if not WATCHLIST:
+        return
+    now = datetime.now(timezone.utc)
+    since = (now.date() - timedelta(days=5)).isoformat()
+    marks = ",".join("?" * len(WATCHLIST))
+    pending = conn.execute(f"""SELECT accession, acceptance, call_last_try FROM filings
+                               WHERE status='ok' AND call_status='pending' AND filing_date >= ?
+                               AND call_tries < ? AND UPPER(ticker) IN ({marks})""",
+                           (since, CALL_MAX_TRIES, *sorted(WATCHLIST))).fetchall()
+    for accession, acceptance, last_try in pending:
+        try:
+            published = datetime.fromisoformat(acceptance.replace("Z", "+00:00"))
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+        except (AttributeError, ValueError):
+            published = now - timedelta(hours=CALL_MIN_HOURS)
+        if now - published < timedelta(hours=CALL_MIN_HOURS):
+            continue
+        if last_try and now - datetime.fromisoformat(last_try) < timedelta(hours=CALL_RETRY_HOURS):
+            continue
+        row = _load_row(conn, accession)
+        try:
+            found = try_call(conn, row, dry_run)
+        except AlphaVantageLimit as e:
+            log(f"Alpha Vantage sin cupo por hoy ({e}); se reintenta más tarde")
+            return
+        except Exception as e:
+            log(f"  error con la call de {row['ticker']}: {e}")
+            found = False
+        if found:
+            continue
+        tries = row["call_tries"] + 1
+        status = "pending" if tries < CALL_MAX_TRIES else "not_found"
+        conn.execute("UPDATE filings SET call_tries=?, call_last_try=?, call_status=? WHERE accession=?",
+                     (tries, now.isoformat(), status, accession))
+        conn.commit()
+        if status == "not_found":
+            send_telegram(f"🎙️ No he encontrado la transcripción de la call de <b>{esc(row['ticker'])}</b> "
+                          f"({esc(row['analysis'].get('periodo'))}). Puedes analizarla a mano más adelante.", dry_run)
 
 
 def run_summary(conn, dry_run=False):
@@ -585,12 +820,30 @@ def run_ticker(conn, ticker, dry_run=False):
         send_telegram(company_detail(result), dry_run)
     else:
         send_telegram(f"⚠️ No se pudo analizar <b>{esc(ticker)}</b>: {esc(LAST_ERROR)}", dry_run)
+    return filing if result else None
+
+
+def run_call_now(conn, ticker, dry_run=False):
+    """Prueba: resultados + call del último trimestre de una empresa, sin esperar."""
+    if not ALPHAVANTAGE_API_KEY:
+        sys.exit("Falta ALPHAVANTAGE_API_KEY")
+    filing = run_ticker(conn, ticker, dry_run)
+    if not filing:
+        return
+    row = _load_row(conn, filing["accession"])
+    try:
+        if not try_call(conn, row, dry_run):
+            send_telegram(f"🎙️ Alpha Vantage aún no tiene la transcripción de <b>{esc(ticker)}</b> "
+                          f"({esc(row['analysis'].get('periodo'))}).", dry_run)
+    except Exception as e:
+        send_telegram(f"⚠️ Error con la call de <b>{esc(ticker)}</b>: {esc(str(e)[:300])}", dry_run)
 
 
 def main():
     p = argparse.ArgumentParser(description="Resultados del S&P 500 por Telegram")
     p.add_argument("--summary", action="store_true", help="envía el resumen de resultados pendientes")
     p.add_argument("--ticker", help="analiza el último resultado de una empresa y lo envía")
+    p.add_argument("--call", help="analiza el último resultado de una empresa junto con su call")
     p.add_argument("--test", action="store_true", help="mensaje de prueba a Telegram")
     p.add_argument("--dry-run", action="store_true", help="imprime en pantalla en lugar de enviar")
     args = p.parse_args()
@@ -604,7 +857,9 @@ def main():
         sys.exit(f"Faltan variables: {', '.join(missing)}")
 
     conn = db_connect()
-    if args.ticker:
+    if args.call:
+        run_call_now(conn, args.call, args.dry_run)
+    elif args.ticker:
         run_ticker(conn, args.ticker, args.dry_run)
     elif args.summary:
         run_summary(conn, args.dry_run)
