@@ -1136,24 +1136,56 @@ def ir_links(cfg):
     return out
 
 
+def _period_tokens(text):
+    k = period_key(text)
+    m = re.fullmatch(r"(q[1-4]|h[12]|fy)-(20\d\d)", k)
+    return m.groups() if m else None
+
+
+def period_rank(k):
+    """Orden cronológico de una clave de periodo ('q3-2026' > 'h1-2026' > 'fy-2025')."""
+    m = re.fullmatch(r"(q[1-4]|h[12]|fy)-(20\d\d)", k or "")
+    if not m:
+        return (0, 0)
+    order = {"q1": 1, "h1": 2, "q2": 2, "q3": 3, "h2": 4, "q4": 4, "fy": 4}
+    return (int(m.group(2)), order[m.group(1)])
+
+
 def ir_document(url):
     """Texto del documento de resultados: el PDF de la nota/carta si lo hay; si no, el texto de la página.
     Devuelve (texto, url_documento) o (None, None) si todavía no está publicado."""
     from urllib.parse import urljoin
+    from bs4 import BeautifulSoup
     r = _web_get(url)
-    if url.lower().endswith(".pdf") or "pdf" in r.headers.get("content-type", ""):
+    if r.content[:4] == b"%PDF" or "pdf" in r.headers.get("content-type", ""):
         return document_to_text("doc.pdf", r.content), url
-    html = r.text
-    pdfs = list(dict.fromkeys(urljoin(url, u) for u in re.findall(r'["\']([^"\']+\.pdf)', html, re.I)))
-    rank = lambda u: (0 if re.search(r"press|release|communiqu|letter|update|results|revenue", u, re.I) else 1,
-                      1 if re.search(r"presentation|slides", u, re.I) else 0)
-    for pdf in sorted(pdfs, key=rank)[:2]:
+    html = r.text.replace("\\u002F", "/").replace("\\/", "/")
+    cands = {}
+    for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
+        if re.search(r"\.pdf($|\?)|/download($|\?)|/api/asset/", a["href"], re.I):
+            cands.setdefault(urljoin(url, a["href"]), a.get_text(" ", strip=True))
+    for u in re.findall(r'["\'](https?://[^"\'\s]+\.pdf)', html, re.I):
+        cands.setdefault(u, "")
+    tokens = _period_tokens(url)
+
+    def rank(item):
+        u, label = item
+        flat = re.sub(r"[^a-z0-9]", "", (u + " " + label).lower())
+        same_period = bool(tokens) and tokens[0] in flat and tokens[1] in flat
+        doc_kind = re.search(r"press|release|communiqu|letter|update|results|revenue", u + " " + label, re.I)
+        slides = re.search(r"presentation|slides", u + " " + label, re.I)
+        return (0 if same_period else 1, 0 if doc_kind else 1, 1 if slides else 0)
+
+    for doc_url, _label in sorted(cands.items(), key=rank)[:3]:
         try:
-            text = document_to_text("doc.pdf", _web_get(pdf).content)
+            d = _web_get(doc_url)
+            if d.content[:4] != b"%PDF" and "pdf" not in d.headers.get("content-type", ""):
+                continue
+            text = document_to_text("doc.pdf", d.content)
             if len(text) > 2000:
-                return text, pdf
+                return text, doc_url
         except Exception as e:
-            log(f"  PDF no legible {pdf}: {e}")
+            log(f"  documento no legible {doc_url}: {e}")
     text = html_to_text(html)
     return (text, url) if len(text) > 6000 and RESULTS_RE.search(text) else (None, None)
 
@@ -1261,7 +1293,8 @@ def run_eu_latest(conn, ticker, dry_run=False):
         items = [(i, t, u) for i, d, t, u in investegate_list(ticker[:-2])
                  if RNS_RESULTS_RE.search(t) and not RNS_NOT_RESULTS_RE.search(t)]
     else:
-        items = [(period_key(u), u, u) for u in ir_links(EU_SOURCES[ticker])]
+        items = sorted(((period_key(u), u, u) for u in ir_links(EU_SOURCES[ticker])),
+                       key=lambda i: period_rank(i[0]), reverse=True)
     for k, title, url in items[:4]:
         log(f"Probando {title}")
         if eu_analyze(conn, ticker, k, url, dry_run=dry_run):
