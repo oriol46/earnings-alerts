@@ -207,16 +207,22 @@ def load_companies(conn):
 
 # ---------------------------------------------------------------- SEC: detectar resultados
 def earnings_filings(company, since_date):
-    """8-K con item 2.02 (Results of Operations) desde since_date (YYYY-MM-DD)."""
+    """8-K con item 2.02 (Results of Operations) desde since_date (YYYY-MM-DD).
+    Para emisores extranjeros de la watchlist, también los 6-K (luego se filtra cuáles son de resultados)."""
     data = sec_get(f"https://data.sec.gov/submissions/CIK{company['cik']:010d}.json").json()
     rec = data["filings"]["recent"]
+    accept_6k = company["ticker"].upper() in WATCHLIST
     out = []
     for i, form in enumerate(rec["form"]):
-        if form != "8-K" or rec["filingDate"][i] < since_date:
+        if rec["filingDate"][i] < since_date:
             continue
-        if not re.search(r"(^|,)\s*2\.02\s*(,|$)", rec["items"][i] or ""):
+        if form == "8-K":
+            if not re.search(r"(^|,)\s*2\.02\s*(,|$)", rec["items"][i] or ""):
+                continue
+        elif not (form == "6-K" and accept_6k):
             continue
         out.append({
+            "form": form,
             "accession": rec["accessionNumber"][i],
             "filing_date": rec["filingDate"][i],
             "acceptance": rec["acceptanceDateTime"][i],
@@ -299,9 +305,11 @@ ANALYSIS_PROMPT = """Eres un analista de renta variable. Analiza el comunicado d
 Registra tu análisis llamando a la herramienta "registrar_resultado". Si no puedes usarla, devuelve SOLO un JSON válido con esta estructura:
 {{
   "periodo": "trimestre y año fiscal, p. ej. '3T FY2026'",
-  "ingresos_musd": número: ingresos totales del trimestre en MILLONES de dólares (p. ej. 94930.0 para 94,93 mil M$), o null,
-  "crec_ingresos_pct": número: variación interanual de esos ingresos en % (p. ej. 8.2 o -3.1), o null,
-  "bpa": número: BPA diluido del trimestre en $ (ajustado si la empresa lo da; si no, GAAP), o null,
+  "es_resultados": true si el documento es un comunicado de resultados o una actualización trimestral de ventas; false si es otra cosa (recompras, juntas, nombramientos…),
+  "moneda": código ISO de la moneda en que presenta las cuentas (USD, EUR, DKK, GBP, CHF, TWD, SEK…),
+  "ingresos_musd": número: ingresos totales del trimestre en MILLONES de esa moneda (p. ej. 94930.0 para 94,93 mil millones), o null,
+  "crec_ingresos_pct": número: variación interanual de esos ingresos en % (p. ej. 8.2 o -3.1); si la empresa destaca el crecimiento orgánico o a tipo constante, usa ese, o null,
+  "bpa": número: BPA diluido del trimestre en esa moneda (ajustado si la empresa lo da; si no, GAAP/IFRS), o null (muchas europeas solo publican ventas en el 1T y 3T),
   "bpa_tipo": "ajustado" | "GAAP",
   "vs_consenso": "bate" | "en linea" | "decepciona" | "sin consenso",
   "guidance": "sube" | "mantiene" | "baja" | "inicia" | "retira" | "no da",
@@ -338,10 +346,13 @@ ANALYSIS_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "es_resultados": {"type": "boolean", "description": "Es un comunicado de resultados o de ventas trimestrales"},
+            "moneda": {"type": "string", "description": "Código ISO de la moneda de presentación, p. ej. USD, EUR, DKK"},
             "periodo": _nullable("string"),
-            "ingresos_musd": {"type": ["number", "null"], "description": "Ingresos totales en millones de $"},
-            "crec_ingresos_pct": {"type": ["number", "null"], "description": "Variación interanual en %"},
-            "bpa": {"type": ["number", "null"], "description": "BPA diluido en $"},
+            "ingresos_musd": {"type": ["number", "null"], "description": "Ingresos totales en millones de la moneda"},
+            "crec_ingresos_pct": {"type": ["number", "null"],
+                                  "description": "Variación interanual en % (orgánica si la empresa la destaca)"},
+            "bpa": {"type": ["number", "null"], "description": "BPA diluido en la moneda"},
             "bpa_tipo": {"type": "string", "enum": ["ajustado", "GAAP"]},
             "vs_consenso": {"type": "string", "enum": ["bate", "en linea", "decepciona", "sin consenso"]},
             "guidance": {"type": "string", "enum": ["sube", "mantiene", "baja", "inicia", "retira", "no da"]},
@@ -352,7 +363,7 @@ ANALYSIS_TOOL = {
             "tono": {"type": "string", "enum": ["positivo", "neutro", "negativo"]},
             "resumen": {"type": "string"},
         },
-        "required": ["periodo", "ingresos_musd", "crec_ingresos_pct", "bpa", "bpa_tipo", "guidance", "destacados", "alertas", "tono",
+        "required": ["es_resultados", "moneda", "periodo", "ingresos_musd", "crec_ingresos_pct", "bpa", "bpa_tipo", "guidance", "destacados", "alertas", "tono",
                      "resumen"],
     },
 }
@@ -391,7 +402,8 @@ def extract_analysis(msg):
 
 
 def analyze(company, filing, doc):
-    consensus = eps_consensus(company["ticker"], filing["filing_date"])
+    # El consenso de Yahoo para un ADR va en $ por ADR y no es comparable con el BPA en moneda local
+    consensus = None if filing.get("form") == "6-K" else eps_consensus(company["ticker"], filing["filing_date"])
     consensus_line = (f"Consenso de BPA para este trimestre (Yahoo Finance, normalmente ajustado): {consensus:.2f} $."
                       if consensus is not None else "No hay dato de consenso disponible.")
     prompt = ANALYSIS_PROMPT.format(name=company["name"], ticker=company["ticker"], sector=company["sector"],
@@ -574,8 +586,17 @@ def _es(x, decimals):
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def _money(x):
-    return f"{_es(x, 2)} $"
+CURRENCY = {"USD": "$", "EUR": "€", "GBP": "£", "DKK": "DKK", "CHF": "CHF", "SEK": "SEK", "NOK": "NOK",
+            "TWD": "NT$", "JPY": "¥", "CNY": "CNY", "HKD": "HK$", "CAD": "C$"}
+
+
+def _cur(a):
+    code = str((a or {}).get("moneda") or "USD").upper()
+    return CURRENCY.get(code, code)
+
+
+def _money(x, a=None):
+    return f"{_es(x, 2)} {_cur(a)}"
 
 
 def _name(row):
@@ -607,8 +628,10 @@ def _num(v):
 
 def _revenue(a):
     musd = _to_float(a.get("ingresos_musd"))
+    cur = _cur(a)
+    unit = f"M{cur}" if len(cur) <= 2 else f"M {cur}"     # M$, M€, M£ · M DKK, M CHF
     if musd is not None:
-        rev = f"{_es(musd / 1000, 1)} mil M$" if abs(musd) >= 10000 else f"{_es(musd, 0)} M$"
+        rev = f"{_es(musd / 1000, 1)} mil {unit}" if abs(musd) >= 10000 else f"{_es(musd, 0)} {unit}"
     else:
         rev = esc(a.get("ingresos")) or "—"  # formato antiguo
     pct = _to_float(a.get("crec_ingresos_pct"))
@@ -621,7 +644,7 @@ def _revenue(a):
 
 def _eps_value(a):
     if _num(a.get("bpa")):
-        return _money(_to_float(a["bpa"])) + (" (GAAP)" if a.get("bpa_tipo") == "GAAP" else "")
+        return _money(_to_float(a["bpa"]), a) + (" (GAAP)" if a.get("bpa_tipo") == "GAAP" else "")
     return esc(a.get("bpa")) or "—"
 
 
@@ -930,7 +953,7 @@ def watchlist_command(conn, text):
             current.append(t)
             note = ""
             if _foreign_filer(hit[0]):
-                note = " · ⚠️ emisor extranjero (6-K): no se detecta sola; envíame la transcripción de la call"
+                note = " · 🌍 emisor extranjero: sigo sus 6-K de resultados (cifras en su moneda, sin consenso de BPA)"
             lines.append(f"• ✅ {esc(t)} ({esc(hit[1].title())}): añadida{note}")
     else:
         for t in tickers:
@@ -1011,12 +1034,32 @@ def run_inbox(conn, dry_run=False):
     _flush_buffer(conn, dry_run)
 
 
+# ---------------------------------------------------------------- 6-K: ¿es un comunicado de resultados?
+RESULTS_RE = re.compile(
+    r"interim report|financial report for the period|quarterly report|half[- ]year(ly)? (report|results)|"
+    r"(first|second|third|fourth) quarter( and (first )?(half|nine months|full[- ]year))?( 20\d\d)? results|"
+    r"results for the (first|second|third|fourth) quarter|\b(q[1-4]|[1-4]q|h[12])\s?20\d\d (results|earnings|report)|"
+    r"(full[- ]year|annual) results|nine months|first half|trading (update|statement)|"
+    r"(net )?(sales|revenue)s? (for|in) the (first|second|third|fourth) quarter|earnings release|"
+    r"consolidated (financial )?results|financial results|reports? (first|second|third|fourth) quarter|"
+    r"quarter(ly)? eps|net (sales|income|revenue).{0,80}\b(q[1-4]|quarter|first half|nine months)\b", re.I)
+
+
+def looks_like_results(text):
+    """Filtro barato para 6-K: busca expresiones de resultados en el principio del documento."""
+    head = text[:6000]
+    if re.search(r"share repurchase|buy-?back programme|transactions in own shares|notice (convening|of)|"
+                 r"major shareholder|managers'? transactions", head[:800], re.I):
+        return False
+    return bool(RESULTS_RE.search(head))
+
+
 # ---------------------------------------------------------------- flujos principales
 def process(conn, company, filing):
     """Descarga y analiza un filing; guarda el resultado. Devuelve la fila o None."""
     acc = filing["accession"]
     row = conn.execute("SELECT status, attempts FROM filings WHERE accession=?", (acc,)).fetchone()
-    if row and (row[0] == "ok" or row[1] >= MAX_ATTEMPTS):
+    if row and (row[0] in ("ok", "skip") or row[1] >= MAX_ATTEMPTS):
         return None
     if not row:
         conn.execute("""INSERT INTO filings (accession, cik, ticker, name, sector, filing_date, acceptance, created_at)
@@ -1027,7 +1070,20 @@ def process(conn, company, filing):
     try:
         log(f"Analizando {company['ticker']} ({filing['filing_date']})")
         doc, url = fetch_press_release(company["cik"], filing)
+        if filing.get("form") == "6-K" and not looks_like_results(doc):
+            conn.execute("UPDATE filings SET status='skip', url=? WHERE accession=?", (url, acc))
+            conn.commit()
+            global LAST_SKIPPED
+            LAST_SKIPPED = True
+            log(f"  {company['ticker']}: 6-K que no es de resultados, se ignora")
+            return None
         analysis, tin, tout = analyze(company, filing, doc)
+        if filing.get("form") == "6-K" and analysis.get("es_resultados") is False:
+            conn.execute("UPDATE filings SET status='skip', url=? WHERE accession=?", (url, acc))
+            conn.commit()
+            LAST_SKIPPED = True
+            log(f"  {company['ticker']}: Claude indica que el 6-K no es de resultados")
+            return None
         conn.execute("""UPDATE filings SET url=?, analysis=?, status='ok', attempts=attempts+1,
                         input_tokens=?, output_tokens=? WHERE accession=?""",
                      (url, json.dumps(analysis, ensure_ascii=False), tin, tout, acc))
@@ -1044,12 +1100,13 @@ def process(conn, company, filing):
 
 
 LAST_ERROR = ""
+LAST_SKIPPED = False
 
 
 def run_check(conn):
     companies = load_companies(conn)
     since = (datetime.now(timezone.utc).date() - timedelta(days=LOOKBACK_DAYS)).isoformat()
-    log(f"Revisando {len(companies)} empresas (8-K item 2.02 desde {since})")
+    log(f"Revisando {len(companies)} empresas (8-K item 2.02 y 6-K de la watchlist desde {since})")
     done, tin, tout, errors = 0, 0, 0, []
     for company in companies:
         try:
@@ -1060,8 +1117,10 @@ def run_check(conn):
         for filing in filings:
             before = conn.execute("SELECT status, attempts FROM filings WHERE accession=?",
                                   (filing["accession"],)).fetchone()
-            if before and (before[0] == "ok" or before[1] >= MAX_ATTEMPTS):
+            if before and (before[0] in ("ok", "skip") or before[1] >= MAX_ATTEMPTS):
                 continue
+            global LAST_SKIPPED
+            LAST_SKIPPED = False
             result = process(conn, company, filing)
             if result:
                 done, tin, tout = done + 1, tin + result["tin"], tout + result["tout"]
@@ -1069,7 +1128,7 @@ def run_check(conn):
                     send_blocks("📢 <b>Resultados publicados</b>", [company_detail(result)])
                     conn.execute("UPDATE filings SET notified=1 WHERE accession=?", (filing["accession"],))
                     conn.commit()
-            else:
+            elif not LAST_SKIPPED:
                 errors.append(f"{company['ticker']}: {LAST_ERROR}")
     log(f"Hecho: {done} resultados analizados · tokens entrada {tin:,} · salida {tout:,}")
     if errors:
