@@ -151,6 +151,37 @@ def load_sp500(conn):
         raise
 
 
+def load_companies(conn):
+    """S&P 500 + los tickers de la watchlist que no están en el índice (p. ej. SPCX), buscados en la SEC."""
+    companies = load_sp500(conn)
+    known = {c["ticker"].upper().replace("-", ".") for c in companies}
+    missing = sorted(t for t in WATCHLIST if t.replace("-", ".") not in known)
+    if not missing:
+        return companies
+    row = conn.execute("SELECT value, updated FROM meta WHERE key='sec_tickers'").fetchone()
+    if row and datetime.now(timezone.utc) - datetime.fromisoformat(row[1]) < timedelta(days=7):
+        sec_map = json.loads(row[0])
+    else:
+        try:
+            raw = sec_get("https://www.sec.gov/files/company_tickers.json").json()
+            sec_map = {v["ticker"].upper(): [int(v["cik_str"]), v["title"]] for v in raw.values()}
+            conn.execute("REPLACE INTO meta VALUES ('sec_tickers', ?, ?)",
+                         (json.dumps(sec_map), datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+        except Exception as e:
+            log(f"No se pudo cargar la lista de tickers de la SEC ({e})")
+            sec_map = json.loads(row[0]) if row else {}
+    extra = []
+    for t in missing:
+        hit = sec_map.get(t) or sec_map.get(t.replace(".", "-"))
+        if hit:
+            extra.append({"ticker": t, "name": hit[1].title(), "sector": "Watchlist (fuera del S&P 500)",
+                          "cik": hit[0]})
+        else:
+            log(f"Watchlist: {t} no aparece en la SEC")
+    return companies + extra
+
+
 # ---------------------------------------------------------------- SEC: detectar resultados
 def earnings_filings(company, since_date):
     """8-K con item 2.02 (Results of Operations) desde since_date (YYYY-MM-DD)."""
@@ -691,7 +722,7 @@ LAST_ERROR = ""
 
 
 def run_check(conn):
-    companies = load_sp500(conn)
+    companies = load_companies(conn)
     since = (datetime.now(timezone.utc).date() - timedelta(days=LOOKBACK_DAYS)).isoformat()
     log(f"Revisando {len(companies)} empresas (8-K item 2.02 desde {since})")
     done, tin, tout, errors = 0, 0, 0, []
@@ -836,10 +867,10 @@ def run_summary(conn, dry_run=False):
 
 def run_ticker(conn, ticker, dry_run=False):
     """Prueba: analiza el último resultado (últimos 120 días) de una empresa y lo envía."""
-    companies = load_sp500(conn)
+    companies = load_companies(conn)
     company = next((c for c in companies if c["ticker"].upper() == ticker.upper()), None)
     if not company:
-        sys.exit(f"{ticker} no está en el S&P 500")
+        sys.exit(f"{ticker} no está en el S&P 500 ni en la watchlist")
     since = (datetime.now(timezone.utc).date() - timedelta(days=120)).isoformat()
     filings = earnings_filings(company, since)
     if not filings:
