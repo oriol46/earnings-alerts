@@ -2,12 +2,12 @@ name: earnings-alerts
 
 on:
   schedule:
-    - cron: "*/30 10-23 * * 1-5"   # cada 30 min, 10:00-23:30 UTC = 6:00-19:30 Nueva York (pre-market y after-hours)
+    - cron: "*/30 5-23 * * 1-5"    # cada 30 min, 5:00-23:30 UTC (Europa desde las 7:00 de Madrid; EE. UU. pre-market y after-hours)
     - cron: "37 6 * * 2-6"         # resumen diario de martes a sábado (8:37 en verano, 7:37 en invierno)
   workflow_dispatch:
     inputs:
       mode:
-        description: "check = revisar · summary = resumen · test = prueba · ticker = analizar una empresa · call = empresa + call"
+        description: "check = revisar · summary = resumen · test = prueba · ticker = analizar una empresa · call = empresa + call · eu = última publicación europea (p. ej. LSEG.L)"
         default: "check"
       ticker:
         description: "Ticker (para los modos ticker y call), p. ej. MSFT"
@@ -53,6 +53,10 @@ jobs:
       - name: Analizar una empresa con su call
         if: github.event.inputs.mode == 'call'
         run: python earnings_alerts.py --call "${{ github.event.inputs.ticker }}"
+
+      - name: Analizar una empresa europea
+        if: github.event.inputs.mode == 'eu'
+        run: python earnings_alerts.py --eu "${{ github.event.inputs.ticker }}"
 
       - name: Revisar resultados nuevos
         if: github.event_name == 'schedule' || github.event.inputs.mode == 'check' || github.event.inputs.mode == 'summary'
