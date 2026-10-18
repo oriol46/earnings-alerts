@@ -298,7 +298,7 @@ ANALYSIS_TOOL = {
             "tono": {"type": "string", "enum": ["positivo", "neutro", "negativo"]},
             "resumen": {"type": "string"},
         },
-        "required": ["periodo", "ingresos_musd", "bpa", "bpa_tipo", "guidance", "destacados", "alertas", "tono",
+        "required": ["periodo", "ingresos_musd", "crec_ingresos_pct", "bpa", "bpa_tipo", "guidance", "destacados", "alertas", "tono",
                      "resumen"],
     },
 }
@@ -528,18 +528,37 @@ def _name(row):
     return re.sub(r"\s*\(The\)$", "", row["name"])
 
 
+def _to_float(v):
+    """Acepta números o textos como '3,03 $', '+11,6%' o '20.300'. None si no se puede."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = re.sub(r"[^\d,.\-+]", "", str(v))
+    if "," in t and "." in t:
+        t = t.replace(".", "").replace(",", ".")
+    elif "," in t:
+        t = t.replace(",", ".")
+    elif re.fullmatch(r"[-+]?\d{1,3}(\.\d{3})+", t):  # '20.300' = veinte mil trescientos
+        t = t.replace(".", "")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
 def _num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return _to_float(v) is not None
 
 
 def _revenue(a):
-    musd = a.get("ingresos_musd")
-    if _num(musd):
+    musd = _to_float(a.get("ingresos_musd"))
+    if musd is not None:
         rev = f"{_es(musd / 1000, 1)} mil M$" if abs(musd) >= 10000 else f"{_es(musd, 0)} M$"
     else:
         rev = esc(a.get("ingresos")) or "—"  # formato antiguo
-    pct = a.get("crec_ingresos_pct")
-    if _num(pct):
+    pct = _to_float(a.get("crec_ingresos_pct"))
+    if pct is not None:
         rev += f" ({'+' if pct > 0 else ''}{_es(pct, 1)}% a/a)"
     elif a.get("crec_ingresos"):
         rev += f" ({esc(a['crec_ingresos'])} a/a)"
@@ -548,7 +567,7 @@ def _revenue(a):
 
 def _eps_value(a):
     if _num(a.get("bpa")):
-        return _money(a["bpa"]) + (" (GAAP)" if a.get("bpa_tipo") == "GAAP" else "")
+        return _money(_to_float(a["bpa"])) + (" (GAAP)" if a.get("bpa_tipo") == "GAAP" else "")
     return esc(a.get("bpa")) or "—"
 
 
