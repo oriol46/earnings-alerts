@@ -53,11 +53,11 @@ A partir de ahí funciona solo.
 ---
 
 ## Tu cartera: aviso inmediato + la call
-Las empresas de la línea `WATCHLIST` del archivo `.yml` (por defecto UBER, NFLX, META, MSFT, SPGI y V) tienen trato especial:
+Las empresas de tu watchlist (archivo `watchlist.txt`) tienen trato especial:
 1. **Al publicar resultados** te llega al momento el mensaje completo (📢 Resultados publicados).
 2. **Después de la call**, en cuanto Alpha Vantage publica la transcripción, te llega el mismo mensaje con la sección 🎙️ *La call*: tono de la directiva, mensajes clave, guidance, cómo respondieron a los analistas (🟢 clara · 🟡 vaga · 🔴 evasiva), riesgos y si la call mejora, confirma o empeora la lectura.
 
-Para añadir o quitar empresas, edita esa línea en GitHub (tickers del S&P 500 separados por comas).
+Para añadir o quitar empresas, escríbele al bot por Telegram: `/añadir AMZN`, `/quitar NKE` o `/lista` (se aplica en unos 10 minutos). La lista se guarda en `watchlist.txt`.
 Para probarlo a mano: **Run workflow** con **mode** = `call` y **ticker** = el que quieras.
 
 ## Analizar cualquier call enviándola por Telegram (TIKR)

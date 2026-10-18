@@ -33,9 +33,27 @@ SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
 
-# Empresas con aviso inmediato de resultados y análisis de la call (separadas por comas)
-WATCHLIST = {t.strip().upper() for t in os.environ.get("WATCHLIST", "UBER,NFLX,META,MSFT,SPGI,V").split(",")
-             if t.strip()}
+# Empresas con aviso inmediato de resultados y análisis de la call.
+# Se leen de watchlist.txt (un ticker por línea; se edita desde Telegram con /añadir y /quitar).
+WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
+
+
+def read_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        with open(WATCHLIST_FILE, encoding="utf-8") as f:
+            items = [l.split("#")[0].strip().upper() for l in f]
+        return [t for t in items if t]
+    return [t.strip().upper() for t in os.environ.get("WATCHLIST", "UBER,NFLX,META,MSFT,SPGI,V").split(",")
+            if t.strip()]
+
+
+def write_watchlist(tickers):
+    with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+        f.write("# Watchlist de Earnings Alerts: un ticker por línea. Se edita desde Telegram con /añadir y /quitar.\n")
+        f.write("\n".join(tickers) + "\n")
+
+
+WATCHLIST = set(read_watchlist())
 CALL_MIN_HOURS = 2          # espera mínima desde los resultados antes de buscar la transcripción
 CALL_RETRY_HOURS = 3        # cada cuánto se reintenta si aún no está publicada
 CALL_MAX_TRIES = 8          # intentos por empresa (~1 día de búsqueda en horario de mercado)
@@ -151,6 +169,23 @@ def load_sp500(conn):
         raise
 
 
+def sec_ticker_map(conn):
+    """{TICKER: [CIK, nombre]} de todas las empresas que presentan en la SEC (se refresca cada 7 días)."""
+    row = conn.execute("SELECT value, updated FROM meta WHERE key='sec_tickers'").fetchone()
+    if row and datetime.now(timezone.utc) - datetime.fromisoformat(row[1]) < timedelta(days=7):
+        return json.loads(row[0])
+    try:
+        raw = sec_get("https://www.sec.gov/files/company_tickers.json").json()
+        sec_map = {v["ticker"].upper(): [int(v["cik_str"]), v["title"]] for v in raw.values()}
+        conn.execute("REPLACE INTO meta VALUES ('sec_tickers', ?, ?)",
+                     (json.dumps(sec_map), datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        return sec_map
+    except Exception as e:
+        log(f"No se pudo cargar la lista de tickers de la SEC ({e})")
+        return json.loads(row[0]) if row else {}
+
+
 def load_companies(conn):
     """S&P 500 + los tickers de la watchlist que no están en el índice (p. ej. SPCX), buscados en la SEC."""
     companies = load_sp500(conn)
@@ -158,19 +193,7 @@ def load_companies(conn):
     missing = sorted(t for t in WATCHLIST if t.replace("-", ".") not in known)
     if not missing:
         return companies
-    row = conn.execute("SELECT value, updated FROM meta WHERE key='sec_tickers'").fetchone()
-    if row and datetime.now(timezone.utc) - datetime.fromisoformat(row[1]) < timedelta(days=7):
-        sec_map = json.loads(row[0])
-    else:
-        try:
-            raw = sec_get("https://www.sec.gov/files/company_tickers.json").json()
-            sec_map = {v["ticker"].upper(): [int(v["cik_str"]), v["title"]] for v in raw.values()}
-            conn.execute("REPLACE INTO meta VALUES ('sec_tickers', ?, ?)",
-                         (json.dumps(sec_map), datetime.now(timezone.utc).isoformat()))
-            conn.commit()
-        except Exception as e:
-            log(f"No se pudo cargar la lista de tickers de la SEC ({e})")
-            sec_map = json.loads(row[0]) if row else {}
+    sec_map = sec_ticker_map(conn)
     extra = []
     for t in missing:
         hit = sec_map.get(t) or sec_map.get(t.replace(".", "-"))
@@ -790,7 +813,8 @@ HELP_TEXT = ("🎙️ <b>Análisis de calls</b>\n"
              "la junto yo), o\n"
              "• envíamela como <b>archivo</b> (PDF, TXT o Word).\n"
              "Opcional: escribe antes el ticker en un mensaje corto (p. ej. <i>NOVO 3T26</i>). "
-             "Escribe <i>analiza</i> si no quieres esperar.")
+             "Escribe <i>analiza</i> si no quieres esperar.\n\n"
+             "📋 <b>Watchlist</b>: <i>/añadir AMZN</i> · <i>/quitar NKE</i> · <i>/lista</i>")
 
 PASTE_MIN_CHARS = 300        # un mensaje más largo se considera parte de una transcripción pegada
 PASTE_QUIET_SECONDS = 60     # se analiza cuando lleva este tiempo sin llegar texto nuevo
@@ -847,6 +871,79 @@ def _flush_buffer(conn, dry_run, force=False):
     _analyze_and_send("\n".join(buf["parts"]), buf.get("hint", ""), "el texto pegado", dry_run)
 
 
+EU_SUFFIXES = {"PA", "AS", "CO", "L", "MC", "DE", "F", "MI", "SW", "BR", "ST", "HE", "OL", "LS", "VI", "IR", "LI"}
+CMD_ADD = {"añadir", "anadir", "add", "agregar", "afegir"}
+CMD_REMOVE = {"quitar", "eliminar", "borrar", "remove", "treure"}
+CMD_LIST = {"lista", "list", "watchlist", "llista"}
+
+
+def _is_european(ticker):
+    return "." in ticker and ticker.rsplit(".", 1)[1] in EU_SUFFIXES
+
+
+def _foreign_filer(cik):
+    """True si la empresa presenta 6-K/20-F (emisor extranjero) en lugar de 10-Q/8-K."""
+    try:
+        forms = set(sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json").json()
+                    ["filings"]["recent"]["form"][:200])
+        return bool(forms & {"6-K", "20-F"}) and not (forms & {"10-Q", "10-K"})
+    except Exception:
+        return False
+
+
+def watchlist_command(conn, text):
+    """Comandos /añadir, /quitar y /lista. Devuelve la respuesta, o None si el texto no es un comando."""
+    words = text.replace(",", " ").split()
+    cmd = words[0].lower().lstrip("/").split("@")[0] if words else ""
+    if cmd not in CMD_ADD | CMD_REMOVE | CMD_LIST:
+        return None
+    global WATCHLIST
+    current = read_watchlist()
+    if cmd in CMD_LIST:
+        us = [t for t in current if not _is_european(t)]
+        eu = [t for t in current if _is_european(t)]
+        out = f"📋 <b>Watchlist</b> ({len(current)})\n🇺🇸 " + (", ".join(us) or "—")
+        if eu:
+            out += "\n🇪🇺 " + ", ".join(eu)
+        return out
+
+    tickers = [w.upper().strip() for w in words[1:]]
+    if not tickers:
+        return f"Escribe el ticker después del comando, p. ej. <i>/{cmd} AMZN</i>"
+    lines = []
+    if cmd in CMD_ADD:
+        sec_map = None
+        for t in tickers:
+            if t in current:
+                lines.append(f"• {esc(t)}: ya estaba")
+                continue
+            if _is_european(t):
+                current.append(t)
+                lines.append(f"• 🇪🇺 {esc(t)}: añadida (las europeas se activarán cuando montemos Europa)")
+                continue
+            if sec_map is None:
+                sec_map = sec_ticker_map(conn)
+            hit = sec_map.get(t) or sec_map.get(t.replace(".", "-"))
+            if not hit:
+                lines.append(f"• ❌ {esc(t)}: no la encuentro en la SEC (¿ticker correcto? Las europeas llevan sufijo, p. ej. MC.PA)")
+                continue
+            current.append(t)
+            note = ""
+            if _foreign_filer(hit[0]):
+                note = " · ⚠️ emisor extranjero (6-K): no se detecta sola; envíame la transcripción de la call"
+            lines.append(f"• ✅ {esc(t)} ({esc(hit[1].title())}): añadida{note}")
+    else:
+        for t in tickers:
+            if t in current:
+                current.remove(t)
+                lines.append(f"• 🗑️ {esc(t)}: quitada")
+            else:
+                lines.append(f"• {esc(t)}: no estaba en la watchlist")
+    write_watchlist(current)
+    WATCHLIST = set(current)
+    return "\n".join(lines) + f"\n\n📋 Watchlist: {len(current)} empresas. Escribe /lista para verla."
+
+
 def run_inbox(conn, dry_run=False):
     """Lee los mensajes nuevos del bot: archivos o texto pegado con transcripciones de calls."""
     row = conn.execute("SELECT value FROM meta WHERE key='tg_offset'").fetchone()
@@ -862,6 +959,11 @@ def run_inbox(conn, dry_run=False):
             continue
 
         text = (msg.get("text") or "").strip()
+        if text and len(text) < PASTE_MIN_CHARS:
+            reply = watchlist_command(conn, text)
+            if reply:
+                send_telegram(reply, dry_run)
+                continue
         if text:
             buf = _get_buffer(conn)
             if len(text) >= PASTE_MIN_CHARS:                       # trozo de una transcripción pegada
