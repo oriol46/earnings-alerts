@@ -3,7 +3,7 @@ name: earnings-alerts
 on:
   schedule:
     - cron: "*/30 5-23 * * 1-5"    # cada 30 min, 5:00-23:30 UTC (Europa desde las 7:00 de Madrid; EE. UU. pre-market y after-hours)
-    - cron: "37 6 * * 2-6"         # resumen diario de martes a sábado (8:37 en verano, 7:37 en invierno)
+    - cron: "45 5,6 * * 2-6"       # resumen diario de martes a sábado a las 7:45 de Madrid (todo el año)
   workflow_dispatch:
     inputs:
       mode:
@@ -63,7 +63,11 @@ jobs:
         run: python earnings_alerts.py
 
       - name: Resumen diario
-        if: github.event.schedule == '37 6 * * 2-6' || github.event.inputs.mode == 'summary'
+        if: github.event.schedule == '45 5,6 * * 2-6'
+        run: python earnings_alerts.py --summary --auto
+
+      - name: Resumen (a mano)
+        if: github.event.inputs.mode == 'summary'
         run: python earnings_alerts.py --summary
 
       # Guarda la base de datos para la siguiente ejecución
